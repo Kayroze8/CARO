@@ -1,0 +1,229 @@
+--- v4b/caro/staged_llm.py
++++ v5/caro/staged_llm.py
+@@ -78,23 +78,25 @@
+     "F33": True,      # post_rules: (xvii) cash loss stated with a non-zero amount
+     "F34": True,      # 13-Oct (Toby): (ix)(e)/(ix)(f) NA only when no subsidiaries/JV/associates or the clause is said not to apply
+     "NO_LABELS": True,  # 13-Oct: Call 2 schema requires label/quote/explanation; a reply with no labels fails loudly
+-    "AMT_PROMPT": True,  # 13-Oct (amounts): Call 1 rules on which printed figures are listed / counted
++    "AMT_PROMPT": False,  # 13-Oct (amounts): Call 1 rules on which printed figures are listed / counted
++    #                       v5 (14-Oct): OFF - prompt frozen to the 13-Oct run (see PROMPT FREEZE below)
+     # 13-Oct (mapping / Option C, Toby): each can be switched off on its own
+-    "XWALK_LAYOUT": True,  # crosswalk only for real CARO 2016 / hybrid layouts; mixed numbering -> subject-only note
+-    "SUBJ_2016": True,     # CARO 2016 units get the subject words of their CARO 2020 successor (clause map)
+-    "ONE_UNIT": True,      # Call 1: a unit's source_text answers only its own question; Call 2: judge the whole text
++    "XWALK_LAYOUT": False,  # v5: OFF (changes the Call 1/2 requests on 2016-layout filings)  # crosswalk only for real CARO 2016 / hybrid layouts; mixed numbering -> subject-only note
++    "SUBJ_2016": False,     # v5: OFF (changes the Call 2 request for CARO 2016 filings)     # CARO 2016 units get the subject words of their CARO 2020 successor (clause map)
++    "ONE_UNIT": False,      # v5: OFF (prompt text)      # Call 1: a unit's source_text answers only its own question; Call 2: judge the whole text
+     "F35": True,           # recheck note: a unit's OWN text is on another unit's subject / is only the printed question
+     "MOVE_PASSAGE": True,  # a Call 2 move of clause-passage words to another unit is applied (words verified)
+     "OWN_TEXT": True,      # post_rules: a label is softened only when the unit's own clean text agrees
+     "TABLE_QUOTE": True,   # a table quote the model re-wrote is replaced by the auditor's own lines
+     # 13-Oct evening batch (register P-ids; Toby approved 13-Oct 20:27). Each can be switched off on its own.
+     "P1": True,    # TRIAL - (vii)(b) with no dispute text: the dispute sentence / table of the (vii) paragraph in a note
+-    "P2": True,    # "hence / accordingly not applicable" after a favourable finding: prompt line + note
+-    "P4": True,    # (iii)(a) is judged on the amounts only (prompt line)
++    "P2": True,    # "hence / accordingly not applicable" after a favourable finding: note + NA/clean table (code)
++    "P2_PROMPT": False,  # v5: the P2 prompt LINE only - OFF (prompt frozen)
++    "P4": False,   # v5: OFF (prompt line)    # (iii)(a) is judged on the amounts only (prompt line)
+     "P5": True,    # a move target takes the recheck answer only when the moved words really changed its text
+     "P6": True,    # F16: a negation anywhere before the name in the sentence; keep (B)'s own denial
+     "P7A": True,   # TRIAL - post_rules: CSR "s.135 applicable but has not been complied with" -> adverse trigger
+-    "P7B": True,   # TRIAL - note: particulars announced ("as under", "following") but not given -> dangling
++    "P7B": False,  # v5: OFF - 14-Oct run: 1 wrong change, 0 right, 4 notes on "following: Nil"   # TRIAL - note: particulars announced ("as under", "following") but not given -> dangling
+     "P7C": True,   # TRIAL - note: (vii)(a) answer while arrears > 6 months are listed in its own text
+     "P7D": True,   # TRIAL - note: (xiv)(a) internal audit required but not carried out
+     "P7E": True,   # TRIAL - note: "insufficient" although the model's own explanation calls the answer incomplete
+@@ -102,17 +104,25 @@
+     "P10": True,   # post_rules: no NA from a sentence with a carve-out / another sub-clause's marker or subject
+     "P11": True,   # post_rules: wordings the rules missed (intangibles, (iv) director loans, "unable to say")
+     "P13": True,   # Call 1: source_text limit per filing; a runaway field is cut, a long field asked once more (+20%)
+-    "P15": True,   # (viii) convention example (prompt line)
++    "P15": False,  # v5: OFF (prompt line)   # (viii) convention example (prompt line)
+     "P16": True,   # TRIAL - note: "except as given in Para (b)" -> the paragraph it points to, from its own clause
+-    "P18": True,   # (x)(b): rights issue / allotment without a compliance statement (prompt line)
++    "P18": False,  # v5: OFF (prompt line)   # (x)(b): rights issue / allotment without a compliance statement (prompt line)
+     # 13-Oct trial run (3 CINs) - corrections
+     "GUARD_INCOMPLETE": True,  # own-question guard: an INCOMPLETE answer naming its own missing figures is not cross-clause
+-    "SCOPE_OWN": True,         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
++    "SCOPE_OWN": True,
++    # 14-Oct full run (v5)
++    "NA_PUSH_V5": True,        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+ # "trial:<fix>" (an existing review_reasons value, no new JSON key) so the run shows every effect. Remove a fix
+ # from this set once the run confirms it; empty the set to remove all trial flags.
+ TRIAL_FIXES = {"P1", "F35", "P16", "P7A", "P7B", "P7C", "P7D", "P7E"}
++# v5 (14-Oct-2026) PROMPT FREEZE: with AMT_PROMPT, XWALK_LAYOUT, SUBJ_2016, ONE_UNIT, P2_PROMPT, P4, P15 and P18 off,
++# the Call 1 and first Call 2 requests are byte-identical to the 13-Oct run's (system, user and schema; proven on all
++# 138 filings by capture). P13 stays on: it only adds maxLength 6,000 to source_text (longest real field 5,234).
++# WHY: the 14-Oct run showed that prompt edits re-shuffle this model's answers on unrelated units (182 first answers
++# changed on identical text, first-answer accuracy 85.6% -> 85.2%); the code fixes are proven by replay on the
++# 13-Oct replies, the prompt edits cannot be proven offline.
+ 
+ 
+ def _on(fix: str) -> bool:
+@@ -1012,7 +1022,7 @@
+ def _call2_batch2(order_year) -> str:
+     ed16 = _is_2016(order_year)
+     lines = []
+-    if _on("P2") and not ed16:
++    if _on("P2_PROMPT") and not ed16:
+         lines.append("  - The (ix)(e) AND (ix)(f) not_applicable rule is ONLY for (ix)(e) and (ix)(f). For every other "
+                      "unit, LABEL VS. SUBSTANCE applies: a favourable finding followed by 'hence / accordingly ... not "
+                      "applicable' ('no fraud was noticed. Hence reporting under 3(xi)(a) to (c) is not applicable'; "
+@@ -2294,12 +2304,16 @@
+     """PATCH 13-Oct-2026 (trial run): a sentence that is the Order's printed question, even without 'whether'
+     (K.R. Foods 2023-24 (iii)(a)(A): 'the aggregate amount during the year, and balance outstanding at the balance
+     sheet date with respect to such loans ... to subsidiaries, joint ventures and associates;')."""
+-    if re.search(r"\b(?:has|have|had|is|are|was|were|been|not|no|nil|none|maintained|regular(?:ly)?|according)\b",
+-                 s or "", re.I):
+-        return False                             # an answer that repeats the question's words
+-    w = set(re.findall(r"[a-z]{4,}", (s or "").lower()))
+-    q = set(re.findall(r"[a-z]{4,}", (question or "").lower()))
+-    return len(w) >= 6 and bool(q) and len(w & q) / len(w) >= 0.7
++    def _q(x: str) -> bool:
++        if re.search(r"\b(?:has|have|had|is|are|was|were|been|not|no|nil|none|maintained|regular(?:ly)?|according)\b",
++                     x or "", re.I):
++            return False                         # an answer that repeats the question's words
++        w = set(re.findall(r"[a-z]{4,}", (x or "").lower()))
++        q = set(re.findall(r"[a-z]{4,}", (question or "").lower()))
++        return len(w) >= 6 and bool(q) and len(w & q) / len(w) >= 0.7
++    # v5 (14-Oct run, K.R. Foods 2023-24 (iii)(a)(B)): "The Following Loan & Advances are Repayment on Demand: the
++    # aggregate amount during the year, and balance outstanding ..." - a heading, then the printed question
++    return _q(s) or (":" in (s or "") and _q(s.rsplit(":", 1)[1]))
+ 
+ 
+ def own_subject_check(uid: str, u: dict, own: str, main_src: str, by: dict) -> Optional[tuple]:
+@@ -2362,6 +2376,8 @@
+ _ARREARS_LISTED = re.compile(r"(?:arrears|outstanding|payable)[^.;]{0,200}?(?:more\s+than|exceeding)\s+(?:six|6)\s+months", re.I)
+ _NO_ARREARS = re.compile(r"\bno\s+(?:\w+\s+){0,6}?(?:arrears|amounts?\s+payable|undisputed)|\bnil\b|were\s+not\s+outstanding"
+                          r"|there\s+(?:are|were)\s+no\b", re.I)
++_MONEY_FIG = re.compile(r"(?:rs\.?|₹|inr)\s*[\d,]+|\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b|"
++                        r"\b\d+(?:\.\d+)?\s*(?:lakhs?|lacs?|crores?|thousands?)\b", re.I)   # v5: money, never a date
+ _IA_NOT_DONE = re.compile(r"internal\s+audit[^.]{0,120}\b(?:not\s+(?:been\s+)?(?:conducted|carried\s+out|done|performed|"
+                           r"appointed)|no\s+internal\s+audit(?:or)?\s+(?:was|has|had)?)|\bno\s+internal\s+audit(?:or)?\b"
+                           r"[^.]{0,80}\b(?:appointed|conducted|carried)", re.I)
+@@ -2370,7 +2386,7 @@
+                                     r"disclose)|not\s+(?:stated|specified|disclosed|given)\b|\bmissing\b|"
+                                     r"\bno\s+(?:figures|amounts?|details|particulars)\b", re.I)
+ _GUESS_WORDS = re.compile(r"\bimpl(?:y|ies|ying|ied)\b|\bpresumabl\w*|\bby\s+default\b|\bit\s+can\s+be\s+inferred\b|"
+-                          r"\binferr?(?:ed|ing)\b|\bassum(?:e|ed|ing|ption)\b|"
++                          r"\binferr?(?:ed|ing)\b|\bassum(?:e|ed|ing)\b|(?<!concern\s)\bassumption\b(?!\s+of\s+(?:the\s+)?going)|"
+                           # v4b (trial K.R. Foods 2021-22 (iv): "funds were utilized for the stated purpose, indicating
+                           # compliance"). Only "indicating compliance": a bare "indicating" is the auditor's own (xix)
+                           # wording ("nothing has come to our attention indicating material uncertainty").
+@@ -2408,6 +2424,9 @@
+         if _norm_txt(sent)[:60] and _norm_txt(sent)[:60] in held:
+             continue
+         tail = t[m.end():m.end() + 400]
++        if re.match(r"\s*[:\-–]?\s*(?:nil|none|not\s+applicable)\b", tail, re.I) or re.search(
++                r"following\s*[:\-–]?\s*(?:nil|none)\b", sent, re.I):
++            continue                                     # v5: "except for the following: Nil"
+         return (sent + ("\n" + tail.strip() if _DISPUTE_WORDS.search(tail) or re.search(r"\d", tail) else ""))[:700]
+     return None
+ 
+@@ -2533,7 +2552,10 @@
+                     from .post_rules import R_ARREARS, R_ARREARS_EXCEPT
+                     if R_ARREARS.hit(own) or R_ARREARS_EXCEPT.hit(own):
+                         break                            # the existing adverse trigger already reads this text
+-                    if re.search(r"\d{3,}|\d+\.\d+", s + tail):
++                    pos = own.find(s)
++                    if _NO_ARREARS.search(own[max(0, pos - 300):pos] + s):
++                        break                            # v5: "There were no undisputed amounts ... Tax. Customs ..."
++                    if _MONEY_FIG.search(s + tail):
+                         note(uid, "P7C", "this unit's own text lists undisputed dues in arrears for more than six "
+                              "months: '" + s[:220] + "'. Read it under the STATUTORY ARREARS rule (arrears listed = "
+                              "adverse) and decide on the auditor's words")
+--- v4b/caro/post_rules.py
++++ v5/caro/post_rules.py
+@@ -217,6 +217,8 @@
+ _NA_STATEMENT = re.compile(r"not\s+applicable|not\s+required|\bnot\s+(?:have|has|had)\s+any\b|does\s+not\s+(?:have|require|arise)|"
+                            r"\bnil\b|\bnone\b|\bno\s+\w+|\bnot\s+(?:granted|made|provided|given|taken|availed|raised|accepted|"
+                            r"incurred|conducted|appointed)|\bnot\s+an?\s+nbfc|nidhi", re.I)
++_AFFIRM_ACTIVITY = re.compile(r"\b(?:has|have)\s+(?:also\s+)?(?:provided|granted|given|made|advanced)\s+(?:any\s+|a\s+|the\s+)?"
++                              r"(?:loans?|guarantees?|security|investments?|advances?)\b", re.I)   # v5
+ _NA_CARVE = re.compile(r"\bexcept\b|\bother\s+than\b|\bsave\s+(?:and\s+except|for)\b|\bhowever\b", re.I)     # CA treats "no IPO / no preferential allotment" as the whole clause
+ 
+ 
+@@ -242,6 +244,16 @@
+     if main_rec.get("_staged") and _patch_on("F12"):
+         if not _NA_STATEMENT.search(q):
+             return False
++        if _patch_on("NA_PUSH_V5"):
++            # v5 (14-Oct run): Apollo 2022-23 (iii) "The Company has provided loan during the current financial year"
++            # and Sahyadri 2024-25 (iii) holding the (ix)(e)/(f) sentence "Accordingly reporting under paragraph
++            # 3(ix)(e) and 3(ix)(f) is not applicable" passed Not Applicable down to unanswered (iii)(a)(A)/(B).
++            if _AFFIRM_ACTIVITY.search(q):
++                return False
++            na_s = [s_ for s_ in re.split(r"(?<=[.;])\s+", q) if _NA_STATEMENT.search(s_)]
++            refs = [set(r_.lower() for r_ in re.findall(r"3\s*\(\s*([ivx]+)\s*\)", s_)) for s_ in na_s]
++            if na_s and all(rf and (main_id or "").lower() not in rf for rf in refs):
++                return False
+         wpat = _WHOLE_ABSENCE.get((main_id or "").lower())
+         if wpat and any(re.search(wpat, sent, re.I) and _NA_CARVE.search(sent)
+                         for sent in re.split(r"(?<=[.;])\s+", q)):
+--- v4b/tests
++++ v5/tests
+@@ -43,6 +43,12 @@
+ logging.disable(logging.CRITICAL)
+ 
+ from caro import pipeline as pl, extract as ex, llm, staged_llm as st   # noqa: E402
++# v5 (14-Oct): the shipped config freezes the prompts (these switches OFF); the suite still proves each feature, so
++# it runs with them ON and checks the shipped values separately (test V5-0).
++_SHIPPED = dict(st.PATCH_SWITCHES)
++_V5_FROZEN = ("AMT_PROMPT", "XWALK_LAYOUT", "SUBJ_2016", "ONE_UNIT", "P2_PROMPT", "P4", "P15", "P18", "P7B")
++for _k in _V5_FROZEN:
++    st.PATCH_SWITCHES[_k] = True
+ from caro import post_rules as pr, mca_table as MT, audit, perf, result_cache          # noqa: E402
+ 
+ RESULTS = []
+@@ -2524,6 +2530,49 @@
+       st._GUESS_WORDS.search("the funds were utilized for the stated purpose, indicating compliance")
+       and not st._GUESS_WORDS.search("nothing has come to the auditor's attention indicating material uncertainty"))
+ 
++check("V5-0 shipped config: the 13-Oct prompts (AMT_PROMPT, XWALK_LAYOUT, SUBJ_2016, ONE_UNIT, P2_PROMPT, P4, P15, "
++      "P18 off) and P7B off; the code fixes (P2 table, P8, P7C, F35, P13, NA_PUSH_V5, amounts) on",
++      all(_SHIPPED.get(k) is False for k in _V5_FROZEN) and all(_SHIPPED.get(k) is True for k in
++          ("P2", "P8", "P7C", "P7E", "F35", "P13", "P1", "P16", "P7A", "NA_PUSH_V5", "GUARD_INCOMPLETE", "SCOPE_OWN")))
++check("V5-1 (14-Oct run, Viraj Canes (xix) x4) P8: 'the going concern assumption' is the auditor's own term, never a "
++      "guess; 'implying', 'we assume', 'based on the assumption that' still are",
++      not st._GUESS_WORDS.search("the going concern assumption is going to continue")
++      and not st._GUESS_WORDS.search("the assumption of going concern is appropriate")
++      and st._GUESS_WORDS.search("implying compliance") and st._GUESS_WORDS.search("we assume no dues")
++      and st._GUESS_WORDS.search("based on the assumption that no loans exist"))
++_t7c = ("There were no undisputed amounts payable in respect of Provident Fund, Income Tax, Goods and Service Tax. Customs "
++        "Duty, Excise Duty, Cess and other material statutory dues in arrears as at March 31, 2024 for a period of more "
++        "than six months from the date they became payable.")
++_n7 = {}
++_r7, _t7, _x7, _s7 = st.batch_notices({"vii_a": {"classification": "clean", "explanation": "No arrears."}},
++                                 {"vii_a": dict(st._empty_unit(), source=_t7c), "vii": dict(st._empty_unit(), source=_t7c)},
++                                 {u["unit"]: u for u in st.catalogue_units(2024)}, 2024, final=False, notes=_n7)
++check("V5-2 (14-Oct run, Viraj Canes 2023-24 (vii)(a)) P7C: a denial cut by a stray full stop ('... Goods and Service "
++      "Tax. Customs Duty ... in arrears ... more than six months') gets no arrears note; a date is not a money figure",
++      "P7C" not in (_t7.get("vii_a") or set()) and not st._MONEY_FIG.search("as at March 31, 2024")
++      and st._MONEY_FIG.search("Rs. 39,75,317") and st._MONEY_FIG.search("4.11 lakhs"))
++check("V5-3 (14-Oct run, Siddhivinayak (vii)(b)) P1: 'except for the following: Nil' is an answer, not dispute text "
++      "left in the paragraph; (K.R. Foods 2023-24 (iii)(a)(B)) a heading + the printed question is not an answer",
++      st._dispute_text("(b) there are no dues of GST ... which have not been deposited by the Company on account of "
++                       "disputes, except for the following: Nil", "") is None
++      and st._is_question_text("The Following Loan & Advances are Repayment on Demand: the aggregate amount during the "
++                               "year, and balance outstanding at the balance sheet date with respect to such loans or "
++                               "advances and guarantees or security to parties other than subsidiaries, joint ventures "
++                               "and associates;", st.catalogue_units(2024)[[u["unit"] for u in st.catalogue_units(2024)].index("iii_a_B")]["question"]))
++_mA = {"main_clause_id": "iii", "_staged": True, "classification": "not_applicable",
++       "evidence_text": "The Company has provided loan during the current financial year. e) The Company has not granted "
++                        "any loan which has fallen due during the year.", "normalized_fields": {}}
++_mS = {"main_clause_id": "iii", "_staged": True, "classification": "not_applicable",
++       "evidence_text": "The company do not have any subsidiary, associates & joint venture during financial year 2024-25 "
++                        "Accordingly reporting under paragraph 3(ix)(e) and 3(ix)(f) is not applicable.", "normalized_fields": {}}
++_mN = {"main_clause_id": "iii", "_staged": True, "classification": "not_applicable",
++       "evidence_text": "The Company has not made any investments, provided any guarantee or security or granted any "
++                        "loans during the year. Accordingly clause 3(iii) is not applicable.", "normalized_fields": {}}
++check("V5-4 (14-Oct run, Apollo 2022-23 / Sahyadri 2024-25 (iii)(a)) Not Applicable is not passed down from a main "
++      "clause that says loans WERE provided, or whose NA sentence is about another clause (3(ix)); a real whole-clause "
++      "denial still is", not _PRm.na_covers(_mA, "iii_a_A", 2023) and not _PRm.na_covers(_mS, "iii_a_B", 2024)
++      and _PRm.na_covers(_mN, "iii_a_A", 2023))
++
+ urllib.request.urlopen = _real_urlopen
+ n_ok = sum(ok for _n, ok in RESULTS)
+ print(f"\n{n_ok}/{len(RESULTS)} Phase 2 checks passed")

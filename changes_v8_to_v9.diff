@@ -1,0 +1,737 @@
+--- a/caro/post_rules.py
++++ b/caro/post_rules.py
+@@ -966,6 +966,11 @@
+         not in ("false", "0", "no", "off")
+     table = ADVERSE_TRIGGERS[_edition(order_year)]
+     done = []
++    # PATCH 15-Oct-2026 (v9, F1): the Adverse rules never read a printed CARO question as a finding
++    _qs = _patch_on("V9_QSTRIP")
++
++    def _rh(rule, t, staged):
++        return rule.hit(strip_printed_questions(t) if (_qs and staged) else t)
+     for r in records or []:
+         if not isinstance(r, dict):
+             continue
+@@ -981,7 +986,12 @@
+             # (the model quoted the finding yet did not grade it)
+             quoted_gap = (wide and cls == "insufficient_evidence"
+                           and rec.get("evidence_check") == "valid" and real_text(rec.get("evidence_text")))
+-            if cls not in _ESCALATABLE and not quoted_gap:
++            # PATCH 15-Oct-2026 (v9, F2): (vii)(a) / (vii)(b) are also read from the whole (vii) passage, even
++            # when the model placed no text on them (Mbook 2024-25 (vii)(b): the dispute table was placed nowhere)
++            f2_unit = (level == "sub" and bool(rec.get("_staged")) and bool(caro_text) and _patch_on("V9_VII_PASSAGE")
++                       and not rec.get("scope_limited")
++                       and _unit_id(rec, level, main_id).lower() in ("vii_a", "vii_b"))
++            if cls not in _ESCALATABLE and not quoted_gap and not (f2_unit and cls == "insufficient_evidence"):
+                 continue
+             uid = _unit_id(rec, level, main_id)
+             rules = [x for x in (table.get(uid) or []) if (wide or not getattr(x, "pkg13", False))
+@@ -993,20 +1003,21 @@
+             nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+             text = "\n".join(strip_labels(t) for t in (real_text(rec.get("evidence_text")),
+                                                       real_text(nf.get("source_text"))) if t)
+-            if not text:
++            if not text and not f2_unit:
+                 continue
++            _st = bool(rec.get("_staged"))
+             hit = None
+-            for rule in rules:
+-                sent = rule.hit(text)
++            for rule in (rules if text else []):
++                sent = _rh(rule, text, _st)
+                 if sent:
+                     hit = (rule, sent, False)
+                     break
+-            if hit is None and wide:
++            if hit is None and wide and text:
+                 win = clause_window(rec.get("evidence_text"), caro_text)
+                 if win:
+                     win = strip_labels(win)
+                     for rule in rules:
+-                        sent = rule.hit(win)
++                        sent = _rh(rule, win, _st)
+                         if sent:
+                             hit = (rule, sent, True)
+                             break
+@@ -1014,10 +1025,10 @@
+             # the auditor's "there are no dues ... on account of any dispute" is printed twice (MCA box, then the
+             # narrative with the CESTAT / GST demand table); the window read only the first copy. Replay over every
+             # unit: exactly this one unit changes.
+-            if hit is None and wide and rec.get("_staged") and _patch_on("F19"):
++            if hit is None and wide and text and rec.get("_staged") and _patch_on("F19"):
+                 for win in clause_windows_all(rec.get("evidence_text"), caro_text)[1:]:
+                     for rule in rules:
+-                        sent = rule.hit(win)
++                        sent = _rh(rule, win, _st)
+                         if sent:
+                             hit = (rule, sent, True)
+                             break
+@@ -1029,7 +1040,7 @@
+                 mnf = r.get("normalized_fields") if isinstance(r.get("normalized_fields"), dict) else {}
+                 mtxt = strip_labels(real_text(mnf.get("source_text")) or "")
+                 if mtxt:
+-                    sent = R_ARREARS_LISTED.hit(mtxt)
++                    sent = _rh(R_ARREARS_LISTED, mtxt, _st)
+                     if sent:
+                         hit = (R_ARREARS_LISTED, sent, True)
+             if hit is None and level == "sub" and rec.get("_staged") and _patch_on("V8_CUT") \
+@@ -1045,15 +1056,26 @@
+                         mtxt = mtxt.replace(t_, " ")
+                 if mtxt:
+                     for rule in rules + ([R_NPA_CUT] if uid in ("ix_a", "viii") else []):
+-                        sent = rule.hit(mtxt)
++                        sent = _rh(rule, mtxt, _st)
+                         if sent and not any(sent[:80] in t_ for t_ in sib if t_):
+                             hit = (rule, sent, True)
+                             rec["v8_cut_read_passage"] = True
+                             break
+             if hit is None and uid == "xvii" and rec.get("_staged") and _patch_on("F33"):          # PATCH 13-Oct-2026 (F33)
+-                sent = cash_loss_with_amount(text)
++                sent = cash_loss_with_amount(strip_printed_questions(text) if _qs else text)
+                 if sent:
+                     hit = (R_CASH_LOSS_AMT, sent, False)
++            if hit is None and f2_unit:                                 # PATCH 15-Oct-2026 (v9, F2)
++                g = vii_passage_hit(uid.lower(), r, subs, rec, caro_text)
++                if g:
++                    hit = (g[0], g[1], True)
++                    rec["v9_vii_passage"] = {"rule": g[0].rid, "words": g[1][:300]}
++            # PATCH 15-Oct-2026 (v9, Fix 4b, Toby 15-Oct): a delay in repaying a lender that was made good (no
++            # "has defaulted", no NPA, nothing unpaid) is Qualified, not Adverse -> the default rule does not escalate
++            if hit and hit[0] is R_DEFAULT and uid in ("ix_a", "viii") and _st and _patch_on("V9_DELAY_QUAL") \
++                    and minor_delay_only(hit[1], text):
++                rec["v9_delay_not_escalated"] = hit[1][:300]
++                hit = None
+             if hit:
+                 rule, sent, from_window = hit
+                 if cls == "insufficient_evidence":
+@@ -3012,6 +3034,13 @@
+             continue
+         if any(x.get("classification") in ("qualified", "adverse") or x.get("scope_limited") for x in [r] + subs):
+             continue
++        # PATCH 15-Oct-2026 (v9, Fix 3d). WHY: N2 (8-Oct) was applied only on the review branch above; on this
++        # label-changing branch a sub-point sentence ("(f) has not granted any loan ... repayable on demand") set
++        # (iii)(b)-(d) to NA (Apollo 2021-22 lost "schedule ... has not been stipulated"). Labels change only when
++        # one sentence covers the WHOLE clause (the word "any" is not required: Aditya 2022-23).
++        if _patch_on("V9_BLANKET_GATE") and any(x.get("_staged") for x in [r] + subs) and not v9_whole_clause(texts):
++            done.append((main_id, "v9_no_whole_clause_sentence"))
++            continue
+         sent = pat.search(blanket)
+         quote = blanket[max(0, sent.start() - 120):sent.end() + 160].strip()
+         changed_here = 0
+@@ -3266,8 +3295,9 @@
+     if uid == "i_c":                           # F09 non-exception: "except the following:" + an empty / NA table
+         m = re.search(r"except\s+(?:for\s+)?the\s+following\s*[:\-–]*", t, re.I)
+         if m:
+-            rest = re.sub(r"(?i)description\s+of\s+property|gross\s+carrying\s+value|held\s+in\s+(?:the\s+)?name\s+of|whether\s+promoter[^A-Z]*?employee|"
+-                          r"period\s+held[^A-Z]*?appropriate|reason\s+for\s+not\s+being\s+held\s+in\s+(?:the\s+)?name\s+of\s+(?:the\s+)?company|\*|"
++            _any = r"[^\n]{0,80}?" if _patch_on("V9_G2_HEADER") else r"[^A-Z]*?"   # PATCH 15-Oct-2026 (v9, Fix 3b)
++            rest = re.sub(r"(?i)description\s+of\s+property|gross\s+carrying\s+value|held\s+in\s+(?:the\s+)?name\s+of|whether\s+promoter" + _any + r"employee|"
++                          r"period\s+held" + _any + r"appropriate|reason\s+for\s+not\s+being\s+held\s+in\s+(?:the\s+)?name\s+of\s+(?:the\s+)?company|\*|"
+                           r"indicate\s+range,?\s+where\s+appropriate|director\s+or\s+their\s+relative\s+or\s+employee|[,\-–:;/()]", "", t[m.end():])
+             if re.fullmatch(r"\s*(?:(?:n\.?\s?a\.?|nil|none|not\s+applicable)\s*)+\.?\s*", rest, re.I):
+                 return t[:240]
+@@ -3640,6 +3670,236 @@
+                 out.append((uid, rid, lab, new))
+             except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
+                 continue
++    return out
++
++
++# ===========================================================================
++# PATCH 15-Oct-2026 (v9). Fixes 1-4 approved by Toby on 15 Oct 2026 (audit of the 14/15-Oct run, 42 CINs).
++# Code only, after the model, two-call records only. Each has its own switch in staged_llm.PATCH_SWITCHES;
++# all off = v8 output. Never changes an Adverse or an Auditor Unable to Verify (except F1/F2/4b, which act
++# inside the Adverse triggers). Every change is in the audit file (v9_rule / v9_vii_passage / v9_delay_not_escalated).
++#   F1  V9_QSTRIP       the printed CARO question ("Whether the company has incurred cash losses ...") is not read
++#                       by the Adverse triggers (Eleanor 2023-24 / 2024-25: 6 false Adverse labels)
++#   F2  V9_VII_PASSAGE  (vii)(a) arrears / (vii)(b) disputed dues read from the whole (vii) passage, bounded at
++#                       (viii), lines rejoined, sibling text removed (Committed 2022-23, Starlite 2020-21, Mbook 2024-25)
++#   3a  V9_IC_NOPROP    (i)(c) "does not hold any immovable property" -> Not Applicable
++#   3b  V9_G2_HEADER    v7 G2 empty exception table: header words were not removed (regex bug), "NA" bodies missed
++#   3c  V9_D3_DISCLOSED (iii)(a) loans given, details "disclosed in the financial statements", no figure -> Qualified (D-3)
++#   3d  V9_BLANKET_GATE blanket NA only from a sentence that covers the whole clause (N2 test on the label branch)
++#   4a  V9_D1C          (vii)(a) "generally regular", no delay, and the arrears question unanswered anywhere in (vii)
++#                       -> Qualified (Toby 15-Oct)
++#   4b  V9_DELAY_QUAL   (ix)(a) a delay made good ("not defaulted ... except some delay", "paid on ...") -> Qualified;
++#                       "has defaulted" / NPA / unpaid stays Adverse (Toby 15-Oct)
++# ===========================================================================
++_V9_Q = re.compile(r"(?:^|(?<=[.;:\n]))\s*(?:\(?[ivx]+\)?\s*)?(?:\(?[a-z]\)\s*)?(?:\([a-z]\)\s*)?"
++                   r"(?:(?!\b(?:we|our|us)\b)[^.;\n]){0,80}?\bwhether\b[^;?\n]*(?:[;?]|$)", re.I)
++
++
++def strip_printed_questions(t: str) -> str:
++    """The text without the printed CARO question(s) (question-and-answer table layouts)."""
++    return _V9_Q.sub(" ", t or "")
++
++
++_V9_VII_END = re.compile(r"\n\s*(?:\(?viii\)?[.)]|8\.)|unrecorded\s+income|previously\s+unrecorded|surrendered\s+or\s+disclosed|"
++                         r"\[MCA_BOX:(?![^\]]*(?:statutory\s+dues|regularity))", re.I)
++_V9_DISPUTE_CTX = re.compile(r"on\s+account\s+of\s+(?:any\s+)?disput|dispute\s+is\s+pending|under\s+dispute", re.I)
++
++
++def _v9_norm(t: str) -> str:
++    return re.sub(r"\s+", " ", t or "").strip()
++
++
++_V9_VII_START = re.compile(r"(?:^|\n)[ \t]*(?:\(\s*vii\s*\)|vii\s*[.)]|7\s*[.)])|\[MCA_BOX:[^\]]*(?:statutory\s+dues|regularity)|"
++                           r"in\s+respect\s+of\s+statutory\s+dues", re.I)
++
++
++_V9_VII_ANCHOR = re.compile(r"undisputed\s+(?:statutory\s+)?dues|in\s+respect\s+of\s+statutory\s+dues|regular(?:ly)?\s+(?:in\s+)?deposit|"
++                            r"statutory\s+dues[^.]{0,200}(?:regular|deposited)", re.I)
++
++
++def vii_passage(main: dict, caro_text: str, subs: Optional[list] = None) -> str:
++    """The (vii) passage(s) of the annexure, found by subject (not by the model's quotes, whose generic opening
++    words can match another clause): every place the statutory-dues answer starts, from the clause's number /
++    MCA box / sentence start to the start of (viii), wrapped lines joined. Several copies (MCA box + narrative)
++    are all kept."""
++    t = caro_text or ""
++    segs, last_end = [], -1
++    for m in _V9_VII_ANCHOR.finditer(t):
++        if m.start() < last_end:
++            continue
++        back = t[max(0, m.start() - 600):m.start()]
++        ms = list(_V9_VII_START.finditer(back))
++        if ms:
++            s0 = max(0, m.start() - 600) + ms[-1].start()
++        else:
++            k = max(back.rfind("\n\n"), back.rfind(". "))
++            s0 = max(0, m.start() - 600) + (k + 1 if k >= 0 else 0)
++        seg = t[s0:s0 + 4000]
++        e = _V9_VII_END.search(seg, (m.start() - s0) + 150)
++        if e:
++            seg = seg[:e.start()]
++        last_end = s0 + len(seg)
++        segs.append(seg)
++    reg = strip_labels("\n\n".join(segs))
++    reg = re.sub(r"(?<![.:;])\s*\n\s*(?=[a-z0-9,(])", " ", reg)
++    return strip_printed_questions(reg) if _patch_on("V9_QSTRIP") else reg
++
++
++def vii_passage_hit(uid: str, main: dict, subs: list, rec: dict, caro_text: str):
++    """(rule, sentence) when the (vii) passage states undisputed arrears over six months ((vii)(a)) or a disputed-dues
++    table with an amount ((vii)(b)); None otherwise."""
++    reg = vii_passage(main, caro_text, subs)
++    if not reg:
++        return None
++    other = "vii_b" if uid == "vii_a" else "vii_a"
++    sib = ""
++    for s in subs:
++        if s is not rec and _unit_id(s, "sub", "vii").lower() == other:
++            sib = _v9_norm(strip_labels(real_text((s.get("normalized_fields") or {}).get("source_text")) or ""))
++    p2 = _v9_norm(reg)
++    if len(sib) >= 20:
++        p2 = p2.replace(sib, " ")
++    if uid == "vii_a":
++        for rule in (R_ARREARS, R_ARREARS_LISTED):
++            h = rule.hit(reg)
++            if h and not re.search(r"(?<!un)disput", h, re.I) and _v9_norm(h)[:40] in p2:
++                return rule, h
++        return None
++    h = R_DISPUTED.hit(reg)
++    if h:
++        k = reg.find(h[:60])
++        if _V9_DISPUTE_CTX.search(reg[max(0, k - 800):k + 200]) and not re.search(r"default|intimation", h, re.I):
++            return R_DISPUTED, h
++    return None
++
++
++_V9_HARD_DEFAULT = re.compile(r"\bhas\s+defaulted|\bhave\s+defaulted|\bNPA\b|non[-\s]?performing|\bnot\s+(?:been\s+)?paid|\bunpaid|"
++                              r"\birr+egular|not\s+(?:been\s+)?regular|outstanding\s+as\s+(?:at|on)|still\s+outstanding|"
++                              r"wil+ful\s+defaulter\s+(?!.{0,20}\bnot)", re.I)
++_V9_DELAY = re.compile(r"\bdelay", re.I)
++
++
++def minor_delay_only(sentence: str, text: str) -> bool:
++    """Toby 15-Oct (4b): the auditor reports only a delay that was made good."""
++    return bool(_V9_DELAY.search(sentence or "")) and not _V9_HARD_DEFAULT.search(text or "") \
++        and not _V9_HARD_DEFAULT.search(sentence or "")
++
++
++_V9_NOPROP = re.compile(r"(?:does|do|did)\s*(?:not|n['’]t)\s+(?:have|hold|own|possess)\s+any\s+immovable\s+propert|"
++                        r"not\s+(?:having|holding|owning)\s+any\s+immovable\s+propert|\bno\s+immovable\s+propert|"
++                        r"(?:does|do)\s*(?:not|n['’]t)\s+hold\s+any\s+(?:freehold\s+)?(?:land|title\s+deeds)", re.I)
++_V9_DISCLOSED = re.compile(r"disclosed\s+in\s+(?:the\s+)?(?:standalone\s+)?(?:financial\s+statements?|notes?\s+to)|refer\s+note", re.I)
++_V9_LOAN_GIVEN = re.compile(r"aggregate\s+amount\s+of\s+(?:the\s+)?(?:loans?|advances?|guarantees?)|"
++                            r"(?:has|have)\s+(?:also\s+)?(?:granted|provided|given|made|advanced|stood)", re.I)
++_V9_D1C_BAD = re.compile(r"\bexcept\b|\bhowever\b|\bbut\b|\bdelay|\bnot\s+(?:been\s+)?(?:regular|deposited|paid)|\birregular|"
++                         r"\bdefault|\bvariation", re.I)
++_V9_HEDGE = re.compile(r"\bgenerally\s+(?:been\s+)?(?:deposited\s+)?regular", re.I)
++_V9_ARREARS_ANSWERED = re.compile(
++    r"\bno\b[^.]{0,80}?\b(?:amounts?|dues|arrears|sums?)\b[^.]{0,300}?(?:six|6)\s+months|"
++    r"\b(?:not|nor)\s+(?:have|had|has)\s+any\b[^.]{0,80}?\b(?:amounts?|dues|arrears)\b[^.]{0,250}?(?:six|6)\s+months|"
++    r"\bno\s+arrears\b|not\s+(?:been\s+)?outstanding[^.]{0,120}(?:six|6)\s+months|"
++    r"\b(?:there\s+)?(?:is|are|were|was)\s+no\s+(?:statutory\s+)?dues\b|\bno\s+dues\s+(?:as\s+on|outstanding)", re.I)
++
++
++def _v9_arrears_answered(passage: str) -> bool:
++    passage = re.sub(r"\s+", " ", passage or "")
++    for s in _sentences(passage):
++        if _V9_ARREARS_ANSWERED.search(s) and not re.search(r"(?<!un)disput", s, re.I):
++            return True
++    # a stray full stop inside the auditor's sentence ("Goods and Service Tax. Customs Duty ... six months"): read a
++    # short window across it. Lenient on purpose -- reading "answered" here can only keep today's label.
++    for m in re.finditer(r"\bno\s+(?:undisputed\s+)?(?:amounts?|dues|arrears)\b", passage, re.I):
++        w = passage[m.start():m.start() + 450]
++        k = re.search(r"(?:six|6)\s+months", w, re.I)
++        if k and not re.search(r"(?<!un)disput", w[:k.end()], re.I):
++            return True
++    return any(rule.hit(passage) for rule in (R_ARREARS, R_ARREARS_LISTED))
++
++
++def v9_whole_clause(texts: list) -> Optional[str]:
++    """N2 whole-clause test (8-Oct) without requiring the word "any": one sentence that says nothing was made /
++    provided / granted / given, names the whole clause, and has no carve-out and no sub-point letter (b)-(h)."""
++    neg = re.compile(r"\bnot\s+(?:made|provided|granted|given|stood)\b", re.I)
++    for t in texts:
++        for s in _p1_sentences(t):
++            if not neg.search(s) or _BLANKET_PARTIAL.search(s) or _SUBPOINT_START.match(s):
++                continue
++            w = s.lower()
++            if _BLANKET_PARTIES.search(s) or all(k in w for k in ("investment", "guarantee", "security", "loan")):
++                return s
++    return None
++
++
++_V9_WHY = {"IC": "the company holds no immovable property, so (i)(c) does not arise (Fix 3a)",
++           "D3B": "loans are stated as given but the amounts are only 'disclosed in the financial statements' (D-3, Fix 3c)",
++           "D1C": "'generally regular' and the arrears question is not answered anywhere in clause (vii) (Toby 15-Oct, Fix 4a)",
++           "DQ": "a delay in repaying a lender that was made good; no default, NPA or unpaid amount (Toby 15-Oct, Fix 4b)"}
++
++
++def apply_v9_rules(records: list, order_year, caro_text: Optional[str] = None) -> list:
++    """PATCH 15-Oct-2026 (v9). Called from pipeline.assemble_document after apply_v8_rules, before the roll-up.
++    Returns [(unit, rule, from, to)]. Never raises."""
++    out = []
++    try:
++        ed = 2016 if _edition(order_year) == 2016 else 2020
++    except Exception:                                          # noqa: BLE001
++        return out
++    for r in records or []:
++        if not isinstance(r, dict):
++            continue
++        main_id = str(r.get("main_clause_id", "")).strip().lower().strip("()")
++        subs = [s for s in (r.get("sub_clauses") or []) if isinstance(s, dict)]
++        for rec, level in ([(s, "sub") for s in subs] or [(r, "main")]):
++            try:
++                if not rec.get("_staged") or any(rec.get(k) for k in _V8_KEEP_KEYS) or rec.get("v8_rule"):
++                    continue
++                cls = rec.get("classification")
++                if cls == "qualified" and rec.get("scope_limited"):
++                    continue
++                lab = _V7_LABEL.get(cls)
++                if lab in (None, "ADV"):
++                    continue
++                uid = _unit_id(rec, level, main_id).lower()
++                nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++                own = strip_labels(real_text(nf.get("source_text")) or "")
++                if own.lower().startswith("(from main clause)"):
++                    own = ""
++                own_a = strip_printed_questions(own)
++                g, rid = None, None
++                if ed == 2020 and uid == "i_c" and lab == "FAV" and _patch_on("V9_IC_NOPROP"):
++                    m = _V9_NOPROP.search(own_a)
++                    if m and not re.search(r"\bexcept\b|\bhowever\b|\bbut\b", own_a, re.I):
++                        g, rid = ("NA", own_a.strip()[:300]), "IC"
++                if g is None and ed == 2020 and uid in ("iii_a_a", "iii_a_b") and lab == "FAV" and _patch_on("V9_D3_DISCLOSED"):
++                    if _V9_DISCLOSED.search(own_a) and _V9_LOAN_GIVEN.search(own_a) and not _V8_AMOUNT.search(own_a) \
++                            and not re.search(r"\b(?:has|have)\s+not\b|\bno\s+(?:loans?|advances?)\b|\bnil\b", own_a, re.I):
++                        g, rid = ("QUAL", own_a.strip()[:300]), "D3B"
++                if g is None and uid == "vii_a" and lab == "FAV" and own and _patch_on("V9_D1C") and caro_text:
++                    if _V9_HEDGE.search(own_a) and not _V8_DELAY.search(own_a) and not _V9_D1C_BAD.search(own_a):
++                        passage = vii_passage(r, caro_text, subs) or own_a
++                        if not _v9_arrears_answered(passage):
++                            g, rid = ("QUAL", _V9_HEDGE.search(own_a).group(0) + " — " + own_a.strip()[:260]), "D1C"
++                if g is None and uid in (("ix_a",) if ed == 2020 else ("viii",)) and lab == "FAV" and own \
++                        and _patch_on("V9_DELAY_QUAL"):
++                    if re.search(r"\bexcept\b[^.]{0,160}\bdelay|\bdelay[^.]{0,120}\b(?:paid|repaid|regulari[sz]ed)", own_a, re.I) \
++                            and not _V9_HARD_DEFAULT.search(own_a):
++                        g, rid = ("QUAL", own_a.strip()[:300]), "DQ"
++                if not g or g[0] == lab:
++                    continue
++                new, words = g
++                info = {"rule": rid, "from_label": lab, "to_label": new, "words": (words or "")[:300], "why": _V9_WHY[rid]}
++                lead = {"FAV": "Favourable", "NA": "Not applicable", "QUAL": "Qualified"}[new]
++                if rid == "D1C":
++                    expl = (lead + " — the auditor says statutory dues were generally regularly deposited but does not "
++                            "state whether any undisputed dues were in arrears for more than six months: \"" + own_a.strip()[:260] + "\"")
++                else:
++                    expl = lead + " — the auditor reports: \"" + (words or "")[:300] + "\""
++                _p1_set_label(rec, _V7_CLS[new], "v9_rule", info, expl, None)
++                if new == "QUAL":
++                    _add_reason(rec, "v9_rule_" + rid)
++                out.append((uid, rid, lab, new))
++            except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
++                continue
+     return out
+ 
+ 
+--- a/caro/pipeline.py
++++ b/caro/pipeline.py
+@@ -524,6 +524,14 @@
+ )
+ 
+ 
++def _v9_on(fix: str) -> bool:
++    try:
++        from .staged_llm import PATCH_SWITCHES
++        return bool(PATCH_SWITCHES.get(fix, False))
++    except Exception:                                   # noqa: BLE001
++        return False
++
++
+ def _check_scope_limitation(rec: dict) -> bool:
+     """Cross-check, not a classifier: if a record the MODEL already
+     classified "qualified" has explanation/evidence text matching the
+@@ -554,6 +562,13 @@
+         if str((rec.get("staged_trace") or {}).get("scope_limited_by_meaning", "")).startswith("rejected"):
+             return False
+         text = f"{rec.get('explanation_text', '')} {rec.get('evidence_text', '')}"
++        # PATCH 15-Oct-2026 (v9, V9_SCOPE_LOANS). WHY: "The Company has not provided loans to others" (Apollo 2021-22
++        # (iii), once Fix 3d let the main clause roll up to Qualified) matched "has not provided" and showed the
++        # clause as Auditor Unable to Verify. A company not GIVING loans / guarantees / security is not the auditor
++        # being refused information.
++        if _v9_on("V9_SCOPE_LOANS"):
++            text = re.sub(r"(?i)\b(?:has|have)\s+not\s+provided\s+(?:any\s+)?(?:loans?|advances?|guarantees?|security|"
++                          r"investments?|corporate\s+guarantee)", " ", text)
+         if not (_SCOPE_LIMITATION_PATTERN.search(text) or SCOPE_LIMITATION_RE.search(text)):
+             return False
+         rec["scope_limited"] = True
+@@ -1200,6 +1215,14 @@
+             logger.info("[v8] %d label(s) set by decision rules: %s", len(_v8), _v8)
+     except Exception as e:                                        # never break extraction
+         logger.warning("[v8] skipped (%s)", e)
++    # PATCH 15-Oct-2026 (v9): fixes 3a, 3c, 4a, 4b (post_rules.apply_v9_rules)
++    try:
++        from .post_rules import apply_v9_rules
++        _v9 = apply_v9_rules(records, getattr(doc, "caro_order_year", None), getattr(doc, "p1_llm_text", None))
++        if _v9:
++            logger.info("[v9] %d label(s) set by v9 rules: %s", len(_v9), _v9)
++    except Exception as e:                                        # never break extraction
++        logger.warning("[v9] skipped (%s)", e)
+     for r in records:
+         _rollup(r)
+     _oy = getattr(doc, "caro_order_year", None)
+--- a/caro/staged_llm.py
++++ b/caro/staged_llm.py
+@@ -51,8 +51,17 @@
+ def llm_flow() -> str:
+     """CARO_LLM_FLOW: single (default, today's one call) | staged (Option A, falls back to the
+     single call per filing) | staged_nofallback (TEST MODE: never the single call -- soft check
+-    failures are only recorded as "would_fall_back" in the audit file)."""
+-    v = (os.environ.get("CARO_LLM_FLOW") or "single").strip().lower()
++    failures are only recorded as "would_fall_back" in the audit file).
++
++    PATCH 15-Oct-2026 (v9, Toby): production runs the two-call flow ONLY. With PATCH_SWITCHES["V9_TWO_CALL_ONLY"]
++    (default True) an unset CARO_LLM_FLOW, "staged" or anything unknown means the two-call flow with no fallback
++    to the single call: a check that used to send the filing to the single call is recorded (audit:
++    would_fall_back) and the units are flagged for review; a filing whose two calls fail is reported as failed.
++    The single-call prompt and code stay in the repository; CARO_LLM_FLOW=single is the emergency rollback."""
++    raw = (os.environ.get("CARO_LLM_FLOW") or "").strip().lower()
++    if PATCH_SWITCHES.get("V9_TWO_CALL_ONLY", False):
++        return "single" if raw == "single" else "staged_nofallback"
++    v = raw or "single"
+     return v if v in FLOWS else "single"
+ 
+ 
+@@ -138,6 +147,17 @@
+     "V8_D3": True,   # incomplete answer on the point's own subject -> Qualified (D-3)
+     "V8_D13": True,  # (v) deposits accepted, provisions "applicable", no compliance stated -> Qualified (D13)
+     "V8_CUT": True,  # a sub-point whose copied text stops at ":" -> Adverse triggers also read the clause passage
++    # PATCH 15-Oct-2026 (v9): fixes 1-4 approved by Toby on 15 Oct (code only, after the model)
++    "V9_TWO_CALL_ONLY": True,  # two-call flow only, never the single-call fallback (CARO_LLM_FLOW=single = emergency rollback)
++    "V9_QSTRIP": True,         # Fix 1: Adverse triggers never read the printed CARO question
++    "V9_VII_PASSAGE": True,    # Fix 2: (vii)(a) arrears / (vii)(b) disputed dues read from the whole (vii) passage
++    "V9_IC_NOPROP": True,      # Fix 3a: (i)(c) no immovable property -> Not Applicable
++    "V9_G2_HEADER": True,      # Fix 3b: v7 G2 empty / "NA" exception table (header words regex)
++    "V9_D3_DISCLOSED": True,   # Fix 3c: (iii)(a) loans given, amounts only "disclosed in the financial statements" -> Qualified
++    "V9_BLANKET_GATE": True,   # Fix 3d: blanket NA only from a whole-clause sentence
++    "V9_D1C": True,            # Fix 4a: (vii)(a) "generally regular", arrears question unanswered in (vii) -> Qualified
++    "V9_SCOPE_LOANS": True,    # companion to 3d: "has not provided loans/guarantees" is not "auditor unable to verify"
++    "V9_DELAY_QUAL": True,     # Fix 4b: (ix)(a) delay made good -> Qualified; "has defaulted" / NPA / unpaid stays Adverse
+     "RECHECK_GUARD": True,     # the recheck reply is capped (RECHECK_MAX_TOKENS) and a network error / timeout in the recheck keeps the first answers instead of failing the filing        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+--- a/caro/audit.py
++++ b/caro/audit.py
+@@ -70,7 +70,9 @@
+               # PATCH 14-Oct-2026 (v7): convention rule (group, from, to, the auditor's words)
+               "v7_rule",
+               # PATCH 14-Oct-2026 (v8): decision rule (D-1, D-2, D-3, D13), and the V8_CUT passage read
+-              "v8_rule", "v8_cut_read_passage")
++              "v8_rule", "v8_cut_read_passage",
++              # PATCH 15-Oct-2026 (v9): fixes 1-4
++              "v9_rule", "v9_vii_passage", "v9_delay_not_escalated")
+ 
+ _LOCK = threading.Lock()
+ 
+@@ -173,6 +175,12 @@
+         acts.append("v8_decision_rule_" + str((rec.get("v8_rule") or {}).get("rule", "")))
+     if rec.get("v8_cut_read_passage"):
+         acts.append("v8_cut_answer_read_with_clause_passage")
++    if rec.get("v9_rule"):
++        acts.append("v9_rule_" + str((rec.get("v9_rule") or {}).get("rule", "")))
++    if rec.get("v9_vii_passage"):
++        acts.append("v9_vii_read_from_clause_passage")
++    if rec.get("v9_delay_not_escalated"):
++        acts.append("v9_minor_delay_kept_qualified")
+     if rec.get("na_pushed_from_main"):
+         acts.append("not_applicable_passed_down_from_main_clause")
+     if rec.get("derived_from_document"):
+--- a/tests/run_phase2_cases.py
++++ b/tests/run_phase2_cases.py
+@@ -52,6 +52,9 @@
+ _V6_FROZEN = ("F35", "P1", "P2_NOTE", "P6", "P7C", "P7D", "P7E", "P8", "P13", "P16", "GUARD_INCOMPLETE_NOTE")
+ for _k in _V5_FROZEN + _V6_FROZEN:
+     st.PATCH_SWITCHES[_k] = True
++# PATCH 15-Oct-2026 (v9): production is two-call only (V9_TWO_CALL_ONLY, shipped True). The suite still proves the
++# single-call fallback machinery kept for rollback (F1-F6), so it runs with the switch OFF; V9-0 checks the shipped value.
++st.PATCH_SWITCHES["V9_TWO_CALL_ONLY"] = False
+ from caro import post_rules as pr, mca_table as MT, audit, perf, result_cache          # noqa: E402
+ 
+ RESULTS = []
+@@ -254,6 +257,231 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# V9 (15-Oct-2026): fixes 1-4. Real filing wording; every rule has a counter-case that must NOT change.
++# Runs on its own with:  python tests/run_phase2_cases.py --v9-only
++# ---------------------------------------------------------------------------
++def v9_cases():
++    import os as _os
++    from caro import post_rules as P9, pipeline as PL9, staged_llm as S9
++    sw = dict(S9.PATCH_SWITCHES)
++    for k in sw:
++        if k.startswith("V9_"):
++            S9.PATCH_SWITCHES[k] = True
++
++    check("V9-0 shipped: every V9 switch is ON (two-call only, fixes 1-4)",
++          all(_SHIPPED.get(k) is True for k in _SHIPPED if k.startswith("V9_")) and "V9_TWO_CALL_ONLY" in _SHIPPED,
++          {k: _SHIPPED.get(k) for k in _SHIPPED if k.startswith("V9_")})
++    saved_env = _os.environ.get("CARO_LLM_FLOW")
++    got = {}
++    for v in (None, "staged", "staged_nofallback", "single", "xyz"):
++        _os.environ.pop("CARO_LLM_FLOW", None)
++        if v:
++            _os.environ["CARO_LLM_FLOW"] = v
++        got[v] = S9.llm_flow()
++    if saved_env is None:
++        _os.environ.pop("CARO_LLM_FLOW", None)
++    else:
++        _os.environ["CARO_LLM_FLOW"] = saved_env
++    check("V9-1 two-call only: unset / staged / unknown -> no fallback; single only when asked (rollback)",
++          got == {None: "staged_nofallback", "staged": "staged_nofallback", "staged_nofallback": "staged_nofallback",
++                  "single": "single", "xyz": "staged_nofallback"}, got)
++
++    # ---- Fix 1: printed question (Eleanor 2023-24 table layout)
++    qa_w = ("ix (b) Whether the company is a declared wilful defaulter by any bank or financial institution or other lender; "
++            "According to the information and explanations given to us and on the basis of our examination of the records of "
++            "the Company, the Company has not been declared a willful defaulter by any bank or financial institution or "
++            "government or government authority.")
++    qa_c = ("(xvii) Cash Losses Whether the company has incurred cash losses in the financial year and in the immediately "
++            "preceding financial year, if so, state the amount of cash losses; The Company has not incurred cash losses in "
++            "the current year and preceding financial year.")
++    check("V9-2 Fix 1: the question sentence alone used to trigger (wilful defaulter, cash loss)",
++          bool(P9.R_WILFUL.hit(qa_w)) and bool(P9.R_CASH_LOSS.hit(qa_c)))
++    check("V9-3 Fix 1: with the question stripped neither triggers",
++          not P9.R_WILFUL.hit(P9.strip_printed_questions(qa_w)) and not P9.R_CASH_LOSS.hit(P9.strip_printed_questions(qa_c)))
++    rec = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_b", "classification": "clean", "_staged": True,
++           "evidence_text": qa_w, "normalized_fields": {"source_text": qa_w}}]}
++    P9.apply_adverse_triggers([rec], 2020, {"ix"})
++    check("V9-4 Fix 1 end to end: Eleanor (ix)(b) stays Favourable", rec["sub_clauses"][0]["classification"] == "clean",
++          rec["sub_clauses"][0].get("severity_escalated_by_rule"))
++    real_ans = ("(b) Whether the dues have not been deposited on account of dispute; The following dues have not been "
++                "deposited on account of dispute: Income Tax Act, Income tax demand Rs. 2,81,900, AY 2018-19, Forum where "
++                "dispute is pending: CIT (Appeals).")
++    check("V9-5 Fix 1 counter-case: a real disputed-dues answer after the question still triggers (Atharv layout)",
++          bool(P9.R_DISPUTED.hit(P9.strip_printed_questions(real_ans))))
++    we = "We have examined whether the company has incurred cash losses of Rs. 12,40,000 during the year."
++    check("V9-6 Fix 1 counter-case: an auditor's own 'we ... whether' sentence is not stripped",
++          "12,40,000" in P9.strip_printed_questions(we))
++
++    # ---- Fix 2: (vii) passage (Committed Ispat 2022-23; Starlite 2020-21 style; K.R. Foods / Rama counter-cases)
++    committed = ("vii.\n\na) According to the information and explanations given to us and the records of the company examined "
++                 "by us, in our opinion, the undisputed statutory dues including income-tax, goods and services Tax, and any "
++                 "other statutory dues, as applicable, have generally been regularly deposited with the appropriate "
++                 "authorities.\n\nb) According to the information and explanations given to us, there were following amounts "
++                 "payable in respect thereof were in arrears as at the last day of the financial year for a period of more "
++                 "than six months from the date they become payable.\n\nAccording to the information and explanations given "
++                 "to us and the records of the company examined by us, there are no statutory dues relating to GST, Provident "
++                 "Fund, Employees State Insurance, income-Tax, Duty of Customs or Cess or other statutory dues, which have not "
++                 "been deposited with the appropriate authorities on account of any dispute.\n\nS. No.\n\nYear\n\nAmount "
++                 "Outstanding as on 31.3.2023\n\n1.\n\nAY-2007-08\n\n33,83,106/-\n\n2.\n\nAY-2011-12\n\n69,290/-\n\n"
++                 "(viii) In our opinion there are no transactions not recorded in books of accounts which have been "
++                 "surrendered or disclosed as income during the year.")
++    a_txt = committed[committed.find("a) According"):committed.find("b) According")].strip()
++    b_txt = committed[committed.find("According to the information and explanations given to us and the records of the company examined by us, there are no statutory"):committed.find("S. No.")].strip()
++
++    def vii(a_cls, a_src, b_cls, b_src):
++        return {"main_clause_id": "vii", "classification": "clean", "normalized_fields": {"source_text": a_src},
++                "sub_clauses": [{"sub_clause_id": "vii_a", "classification": a_cls, "_staged": True, "evidence_text": a_src,
++                                 "evidence_check": "valid", "normalized_fields": {"source_text": a_src}},
++                                {"sub_clause_id": "vii_b", "classification": b_cls, "_staged": True, "evidence_text": b_src,
++                                 "evidence_check": "valid", "normalized_fields": {"source_text": b_src}}]}
++    r = vii("qualified", a_txt, "clean", b_txt)
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=committed)
++    check("V9-7 Fix 2: Committed 2022-23 (vii)(a) arrears listed under 'b)' -> Adverse",
++          r["sub_clauses"][0]["classification"] == "adverse", r["sub_clauses"][0].get("v9_vii_passage"))
++    check("V9-8 Fix 2: Committed 2022-23 (vii)(b) 'no disputed dues' stays Favourable",
++          r["sub_clauses"][1]["classification"] == "clean", r["sub_clauses"][1].get("severity_escalated_by_rule"))
++    starlite = ("(vii) (a) Undisputed statutory dues including Income-tax, Customs Duty, Goods and Service Tax, cess and other "
++                "material statutory dues have generally been regularly deposited with the appropriate authorities.\n(b) "
++                "According to the information and explanations given to us, no undisputed amounts payable in respect of "
++                "income-tax, customs duty, TDS, Goods and Service Tax were in arrears as at 31 March 2021 for a period of "
++                "more than six months from the date they became payable.\n(c) According to the information and explanations "
++                "given to us, the dues which have not been deposited on account of any dispute are as follows:\nName of the "
++                "statute Nature of dues Amount (Rs. in lakhs) Period Forum where the dispute is pending\nAPGST Act Sales tax "
++                "24.27 1996-97 High Court of Telangana\n(viii) There are no transactions not recorded in the books of account.")
++    sa = starlite[starlite.find("(a) Undisputed"):starlite.find("(b) According")].strip()
++    sb = starlite[starlite.find("(b) According"):starlite.find("(c) According")].strip()
++    r = vii("qualified", sa, "clean", sb)
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=starlite)
++    check("V9-9 Fix 2: Starlite 2020-21 disputed APGST table printed as '(c)' -> (vii)(b) Adverse",
++          r["sub_clauses"][1]["classification"] == "adverse", r["sub_clauses"][1].get("v9_vii_passage"))
++    check("V9-10 Fix 2: Starlite (vii)(a) 'no undisputed amounts ... in arrears' is not made Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified")
++    krf = ("(vii) (a) The Company has been generally regular in depositing undisputed statutory dues with the appropriate "
++           "authorities.\n\u2022 According to the information and explanations provided to us, no undisputed amounts payable in "
++           "respect of the\nabove were outstanding, at the year end, for a period of more than six months\nfrom the date when "
++           "they became payable except\nthese two disputes (VAT and CST payable of Rs.\n20,95,74,867 and Rs. 1,00,65,542 "
++           "respectively) are pending before the\nappellate authority.\n(viii) There are no unrecorded transactions.")
++    r = vii("clean", krf[:krf.find("\u2022")].strip(), "adverse", "VAT and CST pending before the appellate authority")
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=krf)
++    check("V9-11 Fix 2 counter-case: K.R. Foods 'no undisputed ... except these two disputes' -> (vii)(a) not Adverse",
++          r["sub_clauses"][0]["classification"] == "clean", r["sub_clauses"][0].get("v9_vii_passage"))
++    rama = ("(vii) a) The Company is regular in depositing undisputed statutory dues with a few delays.\n\nAND\n\nNo undisputed amounts\n"
++            "payable in respect of provident fund, employees' state insurance, income tax, GST,\ncustoms duty, cess and any other "
++            "material statutory dues applicable to it, were\noutstanding, at the year end, for a period of more than six months "
++            "from the\ndate they became payable.\n\n(viii) There are no unrecorded transactions.")
++    r = vii("qualified", "The Company is regular in depositing undisputed statutory dues with a few delays.", "clean", "")
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=rama)
++    check("V9-12 Fix 2 counter-case: Rama Cylinders wrapped 'No undisputed amounts ... outstanding' -> not Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified", r["sub_clauses"][0].get("v9_vii_passage"))
++
++    # ---- Fix 3a-3d
++    def one(main, uid, cls, src, oy=2020, caro=None):
++        r = {"main_clause_id": main, "classification": cls, "normalized_fields": {"source_text": src},
++             "sub_clauses": [{"sub_clause_id": uid, "classification": cls, "_staged": True,
++                              "normalized_fields": {"source_text": src}}]}
++        P9.apply_v9_rules([r], oy, caro)
++        return r["sub_clauses"][0]["classification"]
++    check("V9-13 Fix 3a: Mbook (i)(c) 'doesn't hold any immovable properties' -> NA",
++          one("i", "i_c", "clean", "The Company doesn\u2019t hold any immovable properties. Hence reporting under clause 3(i)(c) "
++                                   "of the Order is not applicable.") == "not_applicable")
++    check("V9-14 Fix 3a counter-case: title deeds held in the company's name stays Favourable",
++          one("i", "i_c", "clean", "The title deeds of all the immovable properties disclosed in the financial statements are "
++                                   "held in the name of the company.") == "clean")
++    hdr = ("the title deeds of all the immovable properties (other than properties where the company is the lessee and the "
++           "lease agreements are duly executed in favour of the lessee) disclosed in the financial statements are held in the "
++           "name of the company, except the following: Description of Property Gross carrying value Held in name of Whether "
++           "promoter, director or their relative or employee Period held - indicate range, where appropriate Reason for not "
++           "being held in name of company ")
++    check("V9-15 Fix 3b: Whofers / Maa Kudargarhi empty 'Not Applicable' / 'NA' exception table -> Favourable (G2)",
++          bool(P9._v7_g2("i_c", "QUAL", hdr + "Not Applicable", "", 2020)) and bool(P9._v7_g2("i_c", "QUAL", hdr + "NA", "", 2020)))
++    check("V9-16 Fix 3b counter-case: Committed 2023-24 real property row stays Qualified",
++          not P9._v7_g2("i_c", "QUAL", hdr + "Office at Anand Parbat 100.00 AGR Steel Strips Pvt Ltd No 2010 Registration under process", "", 2020))
++    u29 = ("The aggregate amount of loans or advances in the nature of loans provided during the year, along with the balance "
++           "outstanding as at the balance sheet date, has been disclosed in the financial statements.")
++    check("V9-17 Fix 3c: U29119 (iii)(a)(B) amounts only 'disclosed in the financial statements' -> Qualified",
++          one("iii", "iii_a_B", "clean", u29) == "qualified")
++    check("V9-18 Fix 3c counter-case: (iii)(a)(B) with the amounts printed stays Favourable",
++          one("iii", "iii_a_B", "clean", u29 + " Aggregate amount granted during the year Rs. 28,33,000; balance Rs. 1,12,45,000.") == "clean")
++    apollo = ["a) The Company has not provided loans to others during the current financial year.",
++              "f) The Company has not granted any loan or advance in the nature of loan during the year, which is repayable on "
++              "demand or without specifying any terms or period of repayment."]
++    aditya = ["(iii)(a) During the year, the Company has not provided loans, advances in the nature of loans, stood guarantee or "
++              "provided security to companies, firms, Limited Liability Partnerships or any other parties."]
++    check("V9-19 Fix 3d: Apollo 2021-22 has no whole-clause sentence (blanket NA must not apply)", not P9.v9_whole_clause(apollo))
++    check("V9-20 Fix 3d counter-case: Aditya 2022-23 whole-clause sentence without 'any' still applies",
++          bool(P9.v9_whole_clause(aditya)))
++    rq = {"classification": "qualified", "explanation_text": "Qualified", "evidence_text": apollo[0], "score_ready_fields": {}}
++    rs = {"classification": "qualified", "explanation_text": "Qualified",
++          "evidence_text": "The management has not provided the stock statements to us.", "score_ready_fields": {}}
++    check("V9-21 companion: 'has not provided loans' is not Auditor Unable to Verify; 'has not provided the statements to us' still is",
++          not PL9._check_scope_limitation(rq) and PL9._check_scope_limitation(rs))
++
++    # ---- Fix 4a: D1C ("generally regular", arrears unanswered anywhere in (vii))
++    def vii_a(src, caro):
++        r = {"main_clause_id": "vii", "classification": "clean", "normalized_fields": {"source_text": src},
++             "sub_clauses": [{"sub_clause_id": "vii_a", "classification": "clean", "_staged": True,
++                              "normalized_fields": {"source_text": src}}]}
++        P9.apply_v9_rules([r], 2020, caro)
++        return r["sub_clauses"][0]["classification"]
++    viraj_ref = ("[MCA_BOX: Disclosure relating to regularity in payment of undisputed statutory dues] According to the "
++                 "information and explanations given to us, amounts deducted / accrued in respect of undisputed statutory dues "
++                 "including GST, Provident fund, Income-tax and other material statutory dues have generally been regularly "
++                 "deposited with the appropriate authorities [MCA_BOX: Disclosure in auditors report relating to default in "
++                 "repayment of financial dues] As per Attachment")
++    check("V9-22 Fix 4a: Viraj Refinery 2024-25 'generally regularly deposited', arrears never answered -> Qualified",
++          vii_a(viraj_ref[viraj_ref.find("According"):viraj_ref.find(" [MCA_BOX: Disclosure in auditors report relating to default")],
++                viraj_ref) == "qualified")
++    shripati = ("(vii) a) The Company has generally been regular in depositing undisputed dues, including Provident Fund, Income "
++                "Tax and other material statutory dues as applicable to it with appropriate authorities.\nb) There were no "
++                "undisputed amounts payable in respect of Provident Fund, Income Tax and other material statutory dues as "
++                "applicable in arrears as at 31st March, 2021 for a period of more than six months from the date they became "
++                "payable.\n(viii) There are no unrecorded transactions.")
++    check("V9-23 Fix 4a counter-case: Shripati 2020-21 arrears answered under 'b)' -> stays Favourable",
++          vii_a(shripati[shripati.find("a) The"):shripati.find("b) There")].strip(), shripati) == "clean")
++    stray = ("vii. According to the information and explanations given to us, in respect of statutory dues:\nThe Company has "
++             "generally been regular in depositing undisputed statutory dues, including Provident Fund, Income Tax, Goods and "
++             "Service Tax and other material statutory dues applicable to it with the appropriate authorities.\nThere were no "
++             "undisputed amounts payable in respect of Provident Fund, Employees'\n\nState Insurance, Income Tax, Goods and\n\n"
++             "Service Tax. Customs Duty, Excise Duty, Cess and other material statutory dues in arrears as at March 31, 2024 for "
++             "a period of more than six months from the date they became payable.\n(viii) There are no unrecorded transactions.")
++    check("V9-24 Fix 4a counter-case: Viraj Canes 2023-24 answer with a stray full stop -> stays Favourable",
++          vii_a("The Company has generally been regular in depositing undisputed statutory dues, including Provident Fund, "
++                "Income Tax, Goods and Service Tax and other material statutory dues applicable to it with the appropriate "
++                "authorities.", stray) == "clean")
++
++    # ---- Fix 4b: delay made good -> Qualified; "has defaulted" stays Adverse
++    ix_fav = ("The Company has not defaulted in the repayment of loans or other borrowings or in the payment of interest thereon "
++              "to any lender except some delay.")
++    check("V9-25 Fix 4b: Apollo 2024-25 'not defaulted ... except some delay' (model Favourable) -> Qualified",
++          one("ix", "ix_a", "clean", ix_fav) == "qualified")
++    dly = ("There has been a delay in repayment of interest of Rs. 2,30,000 to Ugro Capital, which was paid on March 29, 2025.")
++    r = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_a", "classification": "qualified", "_staged": True,
++         "evidence_text": dly, "normalized_fields": {"source_text": dly}}]}
++    P9.apply_adverse_triggers([r], 2020, {"ix"})
++    check("V9-26 Fix 4b: a delay that was paid is not escalated to Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified", r["sub_clauses"][0].get("severity_escalated_by_rule"))
++    hard = ("The Company has defaulted in repayment of loans to the following lender: Bank of India, term loan Rs. 45,00,000, "
++            "delay of 92 days, unpaid as at the balance sheet date.")
++    r = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_a", "classification": "qualified", "_staged": True,
++         "evidence_text": hard, "normalized_fields": {"source_text": hard}}]}
++    P9.apply_adverse_triggers([r], 2020, {"ix"})
++    check("V9-27 Fix 4b counter-case: 'has defaulted' with a delay table stays Adverse (3FATE / Viraj Refinery)",
++          r["sub_clauses"][0]["classification"] == "adverse")
++
++    S9.PATCH_SWITCHES.clear()
++    S9.PATCH_SWITCHES.update(sw)
++
++
++if "--v9-only" in sys.argv:
++    logging.disable(logging.CRITICAL)
++    v9_cases()
++    _fail = [r for r in RESULTS if not r[1]] if RESULTS and isinstance(RESULTS[0], tuple) else []
++    print(f"V9: {sum(1 for r in RESULTS if (r[1] if isinstance(r, tuple) else r))}/{len(RESULTS)} passed")
++    sys.exit(1 if _fail else 0)
++v9_cases()                       # the full suite runs the V9 checks too
++
++
++# ---------------------------------------------------------------------------
+ # fixtures (texts already in the repository + the two synthetic filings below)
+ # ---------------------------------------------------------------------------
+ def _payload_annexure():
+@@ -757,7 +985,10 @@
+ staged = {}
+ # PATCH 14-Oct-2026 (v7): G1-G7 prove the two-call PLUMBING adds nothing, so they run with the v7 convention rules off
+ # (v7 changes labels on purpose after the model; its effect on these fixtures is checked in V7-7 below).
+-_V7_SW = ("V7_G1", "V7_G2", "V7_G3", "V7_G4", "V7_G7", "V7_G8")
++_V7_SW = ("V7_G1", "V7_G2", "V7_G3", "V7_G4", "V7_G7", "V7_G8",
++          # PATCH 15-Oct-2026 (v9): label-changing v9 rules are off for the plumbing checks too (checked in V9-*)
++          "V9_QSTRIP", "V9_VII_PASSAGE", "V9_IC_NOPROP", "V9_G2_HEADER", "V9_D3_DISCLOSED", "V9_BLANKET_GATE",
++          "V9_SCOPE_LOANS", "V9_D1C", "V9_DELAY_QUAL")
+ _v7_saved = {k: st.PATCH_SWITCHES[k] for k in _V7_SW}
+ st.PATCH_SWITCHES.update({k: False for k in _V7_SW})
+ for name in FIX:

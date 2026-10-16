@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xsd:schema attributeFormDefault="unqualified" elementFormDefault="qualified" targetNamespace="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for" xmlns:link="http://www.xbrl.org/2003/linkbase" xmlns:gen="http://xbrl.org/2008/generic" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <xsd:annotation>
+    <xsd:appinfo>
+      <link:roleType id="for_axi" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_axi">
+        <link:definition>Axis aggregation validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_cro" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_cro">
+        <link:definition>Cross period validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+      <link:roleType id="for_eps" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_eps">
+        <link:definition>Earnings per share validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_equ" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_equ">
+        <link:definition>Fact equivalence validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+      <link:roleType id="for_pos" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_pos">
+        <link:definition>Positive fact validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_neg1" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/foz_neg1">
+        <link:definition>Negative fact validations 1</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_neg2" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/foz_neg2">
+        <link:definition>Negative fact validations 2</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_per" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_per">
+        <link:definition>Percentage warnings</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>
+	  <link:roleType id="for_tech" roleURI="http://www.icai.org/xbrl/taxonomy/2017-03-31/ind-as/Formula/rol_for/for_tech">
+        <link:definition>Technical validations</link:definition>
+		<link:usedOn>gen:link</link:usedOn>
+      </link:roleType>	  
+    </xsd:appinfo>
+  </xsd:annotation>
+</xsd:schema>

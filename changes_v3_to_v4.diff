@@ -1,0 +1,381 @@
+--- v3/caro/amounts.py
++++ v4b/caro/amounts.py
+@@ -713,6 +713,7 @@
+     "SIBLING_DUP": True,     # one printed figure on one sub-clause only ((xx)(a)/(b), (iii)(a)(A)/(B))
+     "EVIDENCE_SHOWS_AMOUNT": False, # source_text gets the table row / sentence of a counted figure (off: needs placement fix first)
+     "OWN_CLAUSE_ONLY": True,  # a figure must be printed in this clause's own passage (not another clause's)
++    "ALL_FALSE_RECOVER": True,  # 13-Oct trial run: every figure marked "not counted" -> the code checks decide
+ }
+ 
+ 
+@@ -1291,6 +1292,9 @@
+                     fm_ = _FIG.search(str(pr))
+                     iu_ = None if (fm_ and fm_.group("unit")) else inline_unit(full_text, lp, fm_.group("num") if fm_ else "")
+                     vv = (float(fm_.group("num").replace(",", "")) * iu_) if (fm_ and iu_) else to_rupees(pr, heading_at(full_text, lp, 2500))
++                    if vv == 5e7 and re.search(r"(?:excess\s+of|exceeding|more\s+than|above)\s*(?:rs\.?|\u20b9|inr)?\s*\.?\s*"
++                                               r"(?:5|five)\s*crores?", full_text, re.I):
++                        continue          # v4: the Rs 5 crore threshold of the Order is never a balance
+                     listed.append((str(pr), vv, lp))
+         for pr, vv, lp in listed:
+             if vv and re.search(r"difference\s+of\s*(?:rs\.?|₹|inr|\?)?\s*\.?\s*$", full_text[max(0, lp - 40):lp], re.I):
+@@ -1324,6 +1328,23 @@
+     return None
+ 
+ 
++_PERIOD_LIKE = re.compile(
++    r"\b(?:19|20)\d{2}\s*[-\u2013/]\s*(?:19|20)?\d{2}\b|\b(?:A\.?Y|F\.?Y)\.?\s*\d|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|"
++    r"oct|nov|dec)[a-z]*\.?\s*,?\s*(?:19|20)\d{2}\b|^\s*(?:19|20)\d{2}\s*$", re.I)
++_NOT_MONEY_NOTE = re.compile(r"\b(?:period|date|days?|shares?|acres?|sq\.?\s*(?:ft|m)|percent(?:age)?|rate of|interest rate|number of)\b|%", re.I)
++
++
++def _money_like(it) -> bool:
++    """v4: a model figure that can be money (for ALL_FALSE_RECOVER only): not a year / period / date, and its
++    note does not call it a period, count, area or rate."""
++    if not isinstance(it, dict):
++        return False
++    printed = str(it.get("as_printed") or "")
++    if not printed.strip() or _PERIOD_LIKE.search(printed) or _NOT_MONEY_NOTE.search(str(it.get("note") or "")):
++        return False
++    return bool(_FIG.search(printed))
++
++
+ def compute(rec: dict, uid: str, window: Optional[str], full_text: str, order_year) -> dict:
+     """Amount for one unit. Returns {"amount_total", "items", "method", "note"}."""
+     nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+@@ -1340,6 +1361,23 @@
+         elif early is not None:
+             return early
+     items_in = nf.get("amount_items")
++    all_false_note = None
++    if (staged and amt_switch_on("ALL_FALSE_RECOVER") and isinstance(items_in, list) and items_in
++            and all(isinstance(it, dict) and it.get("counts_toward_total") is False for it in items_in)
++            and rec.get("classification") in ("qualified", "adverse", "clean")
++            and not any(isinstance(x, dict) for x in (rec.get("sub_clauses") or []))):   # v4: a main with sub-clauses keeps today's rule
++        # PATCH 13-Oct-2026 evening (trial run). WHY: with the Call-1 AMOUNT ITEMS rules the model marked EVERY
++        # figure "not counted" - K.R. Foods 2024-25 (vii)(b) disputed VAT Rs 20,95,74,867 + CST Rs 1,00,65,542
++        # (Adverse, amount lost) and 2020-21 (iii)(b) the closing balances of the loan table. When nothing at all
++        # is counted the code's own checks decide instead (they drop paid / opening / previous-year / during-the-
++        # year columns, thresholds, areas and loan balances shown as defaults).
++        # v4 (replay check, Aditya Auto 2023-24 (vii)): only items that look like MONEY are recovered - the
++        # periods of a disputed-dues table ("2011-12, 2012-13", "AY 2013-14", "November 2014-September 2015")
++        # are rightly "not counted" and are never read as rupees.
++        rec_ok = [_money_like(it) for it in items_in]
++        if any(rec_ok):
++            items_in = [dict(it, counts_toward_total=True) if ok else it for it, ok in zip(items_in, rec_ok)]
++            all_false_note = "model_marked_every_figure_not_counted - code checks decide"
+     # 1. the model's list of figures as printed
+     if isinstance(items_in, list) and items_in:
+         kept, dropped, unclear, where, moved = [], [], [], [], []
+@@ -1502,6 +1540,8 @@
+         # 1-Oct (S3): a total built from a figure whose unit could not be
+         # established is not published as rupees; it stays flagged for review
+         total = None if unclear else (round(sum(vals), 2) if vals else None)
++        if all_false_note:
++            notes.append(all_false_note)
+         return {"amount_total": total, "items": kept,
+                 "method": "model_items", "note": "; ".join(notes) or None}
+     # 2. no list: read the auditor's text, only where adding up is always right
+--- v3/caro/staged_llm.py
++++ v4b/caro/staged_llm.py
+@@ -105,6 +105,9 @@
+     "P15": True,   # (viii) convention example (prompt line)
+     "P16": True,   # TRIAL - note: "except as given in Para (b)" -> the paragraph it points to, from its own clause
+     "P18": True,   # (x)(b): rights issue / allotment without a compliance statement (prompt line)
++    # 13-Oct trial run (3 CINs) - corrections
++    "GUARD_INCOMPLETE": True,  # own-question guard: an INCOMPLETE answer naming its own missing figures is not cross-clause
++    "SCOPE_OWN": True,         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+ # "trial:<fix>" (an existing review_reasons value, no new JSON key) so the run shows every effect. Remove a fix
+@@ -1764,6 +1767,27 @@
+     return out
+ 
+ 
++def _incomplete_on_own_subject(uid: str, expl: str, by: dict, own_text: str = "") -> bool:
++    """Every sentence of the explanation that says something is missing names this unit's own subject and no
++    subject of ANOTHER clause (the Atharv (iii)(b) case - 's.185/186 compliance is missing' - stays cross-clause)."""
++    main = by[uid]["main"]
++    own_rx = "|".join(x for x in (by[uid].get("subject_rx"), _F35_MORE.get(uid, "")) if x)
++    sents = [s for s in _sentences(expl) if _ABSENCE_CUE.search(s)]
++    if not sents:
++        return False
++    for s in sents:
++        if not _rx_hit(own_rx, s):
++            return False
++        for k, v in by.items():
++            if k == uid or v["main"] == main or not v.get("subject_rx") or not _rx_hit(v["subject_rx"], s):
++                continue
++            w = re.search(v["subject_rx"], s, re.I).group(0)
++            if _rx_hit(own_rx, w) or re.search(re.escape(w), own_text or "", re.I):
++                continue              # a word of this unit's own text ("register maintained under section 189")
++            return False
++    return True
++
++
+ def own_question_guard(ans: dict, units: dict, by: dict, *, final: bool, notes: dict) -> dict:
+     """Checks every Qualified / Adverse answer. Returns {unit: reason} to send back to Call 2
+     (only when final is False); when final is True an unresolved unit keeps its own-text label."""
+@@ -1787,6 +1811,12 @@
+         # "cross-clause / inconsistent / contradicts", or something of ANOTHER clause (named by its
+         # number, or by its subject words absent from this unit's own text) said to be missing
+         absent = bool(_ABSENCE_CUE.search(expl))
++        if (_on("GUARD_INCOMPLETE") and absent and basis == "incomplete" and own == cls and not _CROSS_CUE.search(expl)
++                and not by[uid]["has_subs"] and _incomplete_on_own_subject(uid, expl, by, own_text0)):
++            # PATCH 13-Oct-2026 (trial run, K.R. Foods 2021-22 (iii)(a)(A)/(B)): "does not disclose the aggregate
++            # amounts ... required for this sub-clause" names THIS unit's own missing particulars - an INCOMPLETE
++            # answer, not a cross-clause reason (it would have sent the filing to the single call)
++            absent = False
+         crossy = basis != "scope_limitation" and (
+             basis == "cross_clause" or bool(_CROSS_CUE.search(expl))
+             or (absent and (bool(_other_clause_refs(expl, main))
+@@ -2255,11 +2285,23 @@
+              "ix_a": r"\bborrowings?\b|\blenders?\b|\bbanks?\b", "viii": r"\bborrowings?\b|\blenders?\b|\bbanks?\b",
+              "i_b": r"verified|verification", "iv": r"loans? to directors|section\s*18[56]|sec\.?\s*18[56]",
+              "xxi": r"group compan|qualifications? or adverse|adverse remarks",
+-             "iii_a_A": r"balance outstanding|aggregate amount|subsidiar|joint venture|associate",
+-             "iii_a_B": r"balance outstanding|aggregate amount|other(?:s|\s+part)|employees"}
++             "iii_a_A": r"balances?\s+outstanding|outstanding|aggregate\s+amounts?|subsidiar|joint venture|associate",
++             "iii_a_B": r"balances?\s+outstanding|outstanding|aggregate\s+amounts?|other(?:s|\s+part)|employees"}
+ _SHORT_NA = re.compile(r"not\s+applicable|\bnil\b|\bn\.?\s?a\.?\b|does\s+not\s+arise|not\s+required|no\s+such", re.I)
+ 
+ 
++def _is_question_text(s: str, question: str) -> bool:
++    """PATCH 13-Oct-2026 (trial run): a sentence that is the Order's printed question, even without 'whether'
++    (K.R. Foods 2023-24 (iii)(a)(A): 'the aggregate amount during the year, and balance outstanding at the balance
++    sheet date with respect to such loans ... to subsidiaries, joint ventures and associates;')."""
++    if re.search(r"\b(?:has|have|had|is|are|was|were|been|not|no|nil|none|maintained|regular(?:ly)?|according)\b",
++                 s or "", re.I):
++        return False                             # an answer that repeats the question's words
++    w = set(re.findall(r"[a-z]{4,}", (s or "").lower()))
++    q = set(re.findall(r"[a-z]{4,}", (question or "").lower()))
++    return len(w) >= 6 and bool(q) and len(w & q) / len(w) >= 0.7
++
++
+ def own_subject_check(uid: str, u: dict, own: str, main_src: str, by: dict) -> Optional[tuple]:
+     """(reason, [other units]) when the unit's own text is on another unit's subject, else None."""
+     body = _MCA_LABEL_RX.sub(" ", own or "")
+@@ -2267,13 +2309,17 @@
+         return None
+     if main_src and _norm_txt(body) == _norm_txt(main_src):
+         return None                                  # the whole clause passage / a blanket statement
++    if _on("F35") and main_src and len(_norm_txt(body)) >= 40 and _norm_txt(body) in _norm_txt(main_src) \
++            and len(_norm_txt(body)) >= 0.8 * len(_norm_txt(main_src)):
++        return None              # PATCH 13-Oct (trial run, Universal 2024-25 (xx)(b)): the clause's own blanket statement
+     sents = [s for p in re.split(r"…|\.{3}", body) for s in _sentences(p) if len(s.strip()) > 3]
+ 
+     def _after_question(s: str) -> str:
+         cut = [m.end() for m in _Q_TAIL.finditer(s)]
+         return s[cut[-1]:] if cut else ("" if (_PRINTED_Q.search(s) or re.search(r"\?\s*$", s)) else s)
+-    answer = [s for s in sents if len(_after_question(s).split()) >= 4 or _SHORT_NA.search(_after_question(s))
+-              or re.fullmatch(r"\W*(?:yes|no|none|nil)\W*", _after_question(s), re.I)]
++    answer = [s for s in sents if (len(_after_question(s).split()) >= 4 or _SHORT_NA.search(_after_question(s))
++              or re.fullmatch(r"\W*(?:yes|no|none|nil)\W*", _after_question(s), re.I))
++              and not _is_question_text(s, u.get("question") or "")]
+     if sents and not answer:
+         return ("only the printed CARO question, no answer", [])
+     if _on("P11") and re.match(r"^\W*as\s+(?:mentioned|stated|given|reported|disclosed)\s+(?:in|under)\s+(?:the\s+|our\s+)?"
+@@ -2324,7 +2370,11 @@
+                                     r"disclose)|not\s+(?:stated|specified|disclosed|given)\b|\bmissing\b|"
+                                     r"\bno\s+(?:figures|amounts?|details|particulars)\b", re.I)
+ _GUESS_WORDS = re.compile(r"\bimpl(?:y|ies|ying|ied)\b|\bpresumabl\w*|\bby\s+default\b|\bit\s+can\s+be\s+inferred\b|"
+-                          r"\binferr?(?:ed|ing)\b|\bassum(?:e|ed|ing|ption)\b", re.I)
++                          r"\binferr?(?:ed|ing)\b|\bassum(?:e|ed|ing|ption)\b|"
++                          # v4b (trial K.R. Foods 2021-22 (iv): "funds were utilized for the stated purpose, indicating
++                          # compliance"). Only "indicating compliance": a bare "indicating" is the auditor's own (xix)
++                          # wording ("nothing has come to our attention indicating material uncertainty").
++                          r"\bindicat(?:ing|es|ed)\s+(?:full\s+|due\s+)?compliance\b", re.I)
+ _P2_UNITS = {"ix_a", "ix_b", "ix_c", "ix_d", "xi_a", "xi_b", "xi_c", "xiv_a", "xv"}
+ # the other P2 units are "always arising" units: post_rules' NA/clean table turns their NA into Favourable when the
+ # unit's own text states the finding (P2 there), so only these two get a note
+@@ -2497,6 +2547,7 @@
+                  "not have is not a clean answer")
+         # ---- P7E "insufficient" although the model calls the answer incomplete (TRIAL) -----------
+         if _on("P7E") and cls == "insufficient_evidence" and _real(own) and not _PRINTED_Q.search(own.strip()) \
++                and not all(_is_question_text(s, u.get("question") or "") for s in _sentences(own) if len(s.strip()) > 3) \
+                 and _MODEL_SAYS_INCOMPLETE.search(a.get("explanation") or ""):
+             note(uid, "P7E", "your explanation says the auditor's answer is incomplete ('" + (a.get("explanation") or "")[:160]
+                  + "'), but the label is insufficient_evidence. insufficient_evidence is ONLY for no answer at all; an "
+@@ -2763,12 +2814,38 @@
+ _SCOPE_MEANING = _ScopeMeaning()
+ 
+ 
+-def _scope_ok(quote: str, d: dict) -> bool:
+-    return bool(quote) and _SCOPE_MEANING.search(quote) is not None and (
++_SUB_MARK = re.compile(r"(?:^|[.;:\u2026]\s*|\n\s*)\(?([a-h]|[AB])\)\s")
++
++
++def _in_sibling_segment(text: str, sentence: str, uid: str) -> bool:
++    """PATCH 13-Oct-2026 (SCOPE_OWN, v4): True when, in the unit's text, the could-not-verify sentence comes after
++    another sub-clause's printed letter, e.g. K.R. Foods 2024-25 (iii)(a)(A): "... (d) If the amount is overdue ...
++    The management has not provided us ... unable to comment". A sentence in the unit's own answer (Jsons (i)(b)
++    "It is not possible to us to verify all the Fixed Assets") is never treated as a sibling's."""
++    own = set(str(uid).split("_")[1:])
++    if not own or not sentence:
++        return False
++    for t in (text if isinstance(text, (list, tuple)) else [text]):
++        pos = t.find(sentence[:60]) if t else -1
++        if pos >= 0:
++            marks = list(_SUB_MARK.finditer(t[:pos + 1]))
++            return bool(marks) and marks[-1].group(1) not in own
++    return False
++
++def _scope_ok(quote: str, d: dict, own_rx: str = "", sib_rx: Optional[list] = None, uid: str = "") -> bool:
++    ok = bool(quote) and _SCOPE_MEANING.search(quote) is not None and (
+         _contains(d.get("source") or "", quote) or _contains(d.get("evidence") or "", quote))
++    if ok and sib_rx and _on("SCOPE_OWN"):
++        # PATCH 13-Oct-2026 (trial run, K.R. Foods 2024-25 (iii)(a)(A)/(B), (iii)(f) -> Auditor Unable to Verify from
++        # the (iii)(d)/(e) sentence "management has not provided us with the relevant data and records regarding
++        # overdue amounts"): the could-not-verify sentence must be on THIS unit's subject, not only a sibling's.
++        sents = [s for s in _sentences(quote) if _SCOPE_MEANING.search(s)]
++        ok = any(not _in_sibling_segment([d.get("source") or "", quote], s, uid) or _rx_hit(own_rx, s) for s in sents) if sents else ok
++    return ok
+ 
+ 
+-def _unit_record(uid: str, ref: str, d: dict, a: Optional[dict], *, main_level: bool, no_text_expl: str) -> dict:
++def _unit_record(uid: str, ref: str, d: dict, a: Optional[dict], *, main_level: bool, no_text_expl: str,
++                 own_rx: str = "", sib_rx: Optional[list] = None) -> dict:
+     cls = (a or {}).get("classification") or "insufficient_evidence"
+     quote = (a or {}).get("evidence") or ""
+     if cls != "insufficient_evidence" and not quote:
+@@ -2785,7 +2862,7 @@
+             expl = no_text_expl
+     scope = None
+     if (a or {}).get("scope_limited") and cls != "adverse":
+-        scope = _scope_ok(quote, d)
++        scope = _scope_ok(quote, d, own_rx, sib_rx, uid)
+         if scope:
+             cls = "qualified"                         # today's rule: a scope limitation is "qualified"
+     nf = {"summary_label": ref,
+@@ -2848,7 +2925,8 @@
+         sub_recs = []
+         for s in subs:
+             r = _unit_record(s["unit"], s["ref"], units.get(s["unit"]) or _empty_unit(), ans.get(s["unit"]),
+-                             main_level=False, no_text_expl=no_text)
++                             main_level=False, no_text_expl=no_text, own_rx=s.get("subject_rx") or "",
++                             sib_rx=[x.get("subject_rx") for x in subs if x["unit"] != s["unit"] and x.get("subject_rx")])
+             r = {"sub_clause_id": s["unit"], "sub_clause_ref": s["ref"], **r}
+             _batch_marks(r, s["unit"], notes, still_other)
+             sub_recs.append(r)
+--- v3/caro/post_rules.py
++++ v4b/caro/post_rules.py
+@@ -386,7 +386,41 @@
+ _SCOPE_ELIGIBLE = ("clean", "qualified", "insufficient_evidence", "not_applicable")
+ 
+ 
+-def apply_scope_limitation(records: Iterable[dict]) -> list:
++_SUB_MARK = re.compile(r"(?:^|[.;:\u2026]\s*|\n\s*)\(?([a-h]|[AB])\)\s")
++
++
++def _in_sibling_segment(text: str, sentence: str, uid: str) -> bool:
++    """PATCH 13-Oct-2026 (SCOPE_OWN, v4): True when, in the unit's text, the could-not-verify sentence comes after
++    another sub-clause's printed letter, e.g. K.R. Foods 2024-25 (iii)(a)(A): "... (d) If the amount is overdue ...
++    The management has not provided us ... unable to comment". A sentence in the unit's own answer (Jsons (i)(b)
++    "It is not possible to us to verify all the Fixed Assets") is never treated as a sibling's."""
++    own = set(str(uid).split("_")[1:])
++    if not own or not sentence:
++        return False
++    for t in (text if isinstance(text, (list, tuple)) else [text]):
++        pos = t.find(sentence[:60]) if t else -1
++        if pos >= 0:
++            marks = list(_SUB_MARK.finditer(t[:pos + 1]))
++            return bool(marks) and marks[-1].group(1) not in own
++    return False
++
++def _scope_on_sibling_only(rec: dict, uid: str, sentence: str, order_year, text: str = "") -> bool:
++    """PATCH 13-Oct-2026 (trial run, SCOPE_OWN, two-call records only). The could-not-verify sentence is on a SIBLING
++    sub-clause's subject and not on this unit's (K.R. Foods 2024-25 (iii)(a)(A): the (iii)(d) sentence 'management
++    has not provided ... overdue amounts exceeding ninety days ... unable to comment')."""
++    if not (rec.get("_staged") and _patch_on("SCOPE_OWN")) or order_year is None:
++        return False
++    own_clean_text(rec, None, uid, order_year)          # fills the subject-word cache for this Order
++    key = 2016 if _edition(order_year) == 2016 else 2020
++    rx, _nrx, sib, _mrx = (_OWN_RX.get(key) or {}).get(uid.lower(), ("", "", [], ""))
++    if not sib:
++        return False
++    if not _in_sibling_segment(text, sentence, uid):
++        return False
++    return not (rx and re.search(rx, sentence, re.I))
++
++
++def apply_scope_limitation(records: Iterable[dict], order_year=None) -> list:
+     """Mark auditor scope limitations in place (sub-clauses, and main clauses
+     that have no sub-clauses). The unit becomes classification "qualified" with
+     scope_limited=True -- displayed as "Auditor Unable to Verify" under
+@@ -407,6 +441,11 @@
+             m = SCOPE_LIMITATION_RE.search(ev) if ev else None
+             if not m:
+                 continue
++            _s = next((s for s in _sentences(ev) if SCOPE_LIMITATION_RE.search(s)), ev)
++            if _scope_on_sibling_only(rec, _unit_id(rec, level, main_id), _s, order_year,
++                                      [real_text((rec.get("normalized_fields") or {}).get("source_text")) or "", ev]):
++                rec.setdefault("own_text_kept", {"rule": "scope_limitation", "why": "could-not-verify sentence is a sibling's"})
++                continue
+             prev = rec.get("classification")
+             rec["scope_limited"] = True
+             if prev != "qualified":
+--- v3/caro/pipeline.py
++++ v4b/caro/pipeline.py
+@@ -1870,7 +1870,7 @@
+                 # CHANGE 9 (C11+P6): auditor scope limitations -> qualified,
+                 # scope_limited=True ("Auditor Unable to Verify" under v2).
+                 # Switch off with CARO_SCOPE_LIMITATION=false.
+-                scope_marked = (apply_scope_limitation(extracted)
++                scope_marked = (apply_scope_limitation(extracted, order_year)
+                                 if _env_flag("CARO_SCOPE_LIMITATION", True) else [])
+                 if scope_marked:
+                     logger.info("[post_rules] %d auditor scope limitation(s): %s",
+--- v3/tests
++++ v4b/tests
+@@ -2478,6 +2478,52 @@
+       "JSON key); TRIAL_FIXES lists P1, F35 (P3), P16, P7A-P7E",
+       "trial:P1" in (_rm.get("review_reasons") or []) and {"P1", "F35", "P16", "P7A", "P7E"} <= st.TRIAL_FIXES)
+ 
++def _amt_f(uid, cls, items, text, fy_year):
++    r = {"classification": cls, "evidence_text": text.split("\n")[0], "staged_trace": {}, "sub_clause_id": uid,
++         "normalized_fields": {"source_text": text, "amount_items": [dict(as_printed=a, counts_toward_total=False, note=n)
++                                                                    for a, n in items]}}
++    return _AM.compute(r, uid, text, text, fy_year)
++
++
++_t_kr = ("(vii)(b) Dues not deposited on account of dispute: Name of statute Nature Amount Forum Delhi VAT Act VAT "
++         "Rs 20,95,74,867 Additional Commissioner\n")
++_t_ad = ("(vii)(b) Dues not deposited on account of dispute: Name of the Statute Nature of Dues Amount Disputed (Rs. in "
++         "lakhs) Period Forum Tamil Nadu VAT Act, 2006 VAT 2011-12, 2012-13 Appellate Assistant Commissioner Income Tax "
++         "Act, 1961 Income Tax AY 2013-14 & AY 2015-16 Commissioner Appeals\n")
++_r1 = _amt_f("vii_b", "adverse", [("Rs 20,95,74,867", "VAT disputed")], _t_kr, 2025)
++_r2 = _amt_f("vii_b", "adverse", [("2011-12, 2012-13", "VAT Period"), ("AY 2013-14 & AY 2015-16", "Income Tax Period")],
++             _t_ad, 2024)
++check("V4-A (trial K.R. Foods 2024-25 (vii)(b); replay Aditya Auto 2023-24 (vii)) every figure marked 'not counted': "
++      "money figures are recovered (Rs 20,95,74,867), periods of a dues table ('2011-12, 2012-13', 'AY 2013-14') never",
++      _r1["amount_total"] == 209574867.0 and _r2["amount_total"] is None, (_r1, _r2))
++_t_5c = ("(ii)(b) During the year, the Company has been sanctioned Working Capital limits in excess of Rs 5 Crore in "
++         "aggregate from banks on the basis of security of current assets. Further there are difference in quarterly "
++         "returns filed with bank as per the books of account. The balance as per stock statement submitted to bank was "
++         "Rs. 833.43 Lakh and as per audited books of account Rs. 767.79 Lakh.\n")
++_r3 = _amt_f("ii_b", "qualified", [("Rs 5 Crore", "limit"), ("Rs. 833.43 Lakh", "statement"),
++                                   ("Rs. 767.79 Lakh", "books")], _t_5c, 2023)
++check("V4-B (replay U51909DL2004PTC127807 2022-23 (ii)(b)) the Order's Rs 5 crore threshold is not a balance: the "
++      "amount is the books-vs-statement difference Rs 65.64 lakh, not the larger balance",
++      _r3["amount_total"] == 6564000.0, _r3)
++_kr = ("(A) the aggregate amount ... The Following Loan & Advances are Repayment on Demand \u2026 (d) If the amount is "
++       "overdue, state the total amount overdue; The management has not provided us with the relevant data and records "
++       "regarding overdue amounts. Consequently, we are unable to comment on the total amount overdue")
++_js = ("b) As informed to us, all the Property, Plant & Equipment have been physically verified by the management. It is "
++       "not possible to us to verify all the Fixed Assets owned by the company considering the quantity and volume.")
++_vj = "Since no repayment terms being prescribed, we are unable to comment the overdue amounts, if any."
++check("V4-C (trial K.R. Foods 2024-25 (iii)(a)(A); replay Jsons / Western Precicast (i)(b), Viraj (iii)(e)) a "
++      "could-not-verify sentence printed after ANOTHER sub-clause's letter is that sibling's; a sentence in the unit's "
++      "own answer stays the unit's (Auditor Unable to Verify kept)",
++      _PRm._in_sibling_segment(_kr, "The management has not provided us with the relevant data", "iii_a_A")
++      and st._in_sibling_segment([_kr], "Consequently, we are unable to comment", "iii_f")
++      and not _PRm._in_sibling_segment(_js, "It is not possible to us to verify all the Fixed Assets", "i_b")
++      and not _PRm._in_sibling_segment(_vj, "Since no repayment terms being prescribed", "iii_e"))
++
++check("V4-D (trial K.R. Foods 2021-22 (iv)) P8: 'indicating compliance' is a guess and gets the one re-read note; the "
++      "auditor's own (xix) wording 'nothing has come to our attention indicating material uncertainty' does not",
++      st._GUESS_WORDS.search("the funds were utilized for the stated purpose, indicating compliance")
++      and not st._GUESS_WORDS.search("nothing has come to the auditor's attention indicating material uncertainty"))
++
+ urllib.request.urlopen = _real_urlopen
+ n_ok = sum(ok for _n, ok in RESULTS)
+ print(f"\n{n_ok}/{len(RESULTS)} Phase 2 checks passed")

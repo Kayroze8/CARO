@@ -1,0 +1,42 @@
+# Core extraction has NO hard third-party deps (uses stdlib only).
+# These are optional, per backend / source type:
+
+# real-PDF text layer (only if you feed an actual %PDF instead of an XBRL render)
+pdfplumber>=0.11
+
+# required for --cin mode (S3 download + .env config)
+boto3>=1.34
+python-dotenv>=1.0
+
+# in-process Qwen3 (only for --backend transformers; needs a GPU)
+# transformers>=4.51
+# torch
+
+# Ollama and OpenAI-compatible (vLLM) backends use urllib from the stdlib —
+# nothing to install on the client side. Just run the server:
+#   ollama pull qwen3:8b && ollama serve
+#   # or: vllm serve Qwen/Qwen3-8B --enable-reasoning --reasoning-parser deepseek_r1
+
+# OCR for Non-XBRL / scanned filings (caro/ocr.py).
+# Default backend - CPU only, also needs the tesseract binary:
+#   apt-get install tesseract-ocr
+pytesseract>=0.3.10
+Pillow>=10.0
+# Page rasterisation. PyMuPDF needs no external binary and is preferred;
+# pdf2image is the fallback and requires Poppler (apt-get install poppler-utils).
+PyMuPDF>=1.24
+# pdf2image>=1.17
+
+# Optional stronger backend (OCR_BACKEND=paddleocr). Install ONE of:
+#   pip install paddleocr paddlepaddle        # CPU
+#   pip install paddleocr paddlepaddle-gpu    # CUDA
+# paddleocr>=2.7
+
+# HTTP API (api.py). Not needed for CLI-only or programmatic use.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+# boto3 is only required for CIN_SOURCE=s3.
+
+# Reads the CARO applicability answer out of Form AOC-4 (XFA form data).
+# Non-XBRL filings only; without it the pipeline falls back to prose detection.
+pypdf>=4.0

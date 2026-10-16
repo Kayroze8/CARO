@@ -1,0 +1,419 @@
+--- v7/caro/staged_llm.py
++++ v8/caro/staged_llm.py
+@@ -131,6 +131,13 @@
+     "V7_G4": True,   # -> Qualified: stated exceptions ((iii)(f) demand loans given, (xiv) IA required not done, (x)(b) allotment, D01-a, "although, in our opinion")
+     "V7_G7": True,   # -> Not Applicable: conventions ((viii) "accordingly not applicable", (iv), (iii)(e)/(f) nil, a sub-clause NAMED as not applicable)
+     "V7_G8": True,   # -> Auditor Unable to Verify: could-not-verify wordings the scope list misses
++    # PATCH 14-Oct-2026 (v8): Toby's decisions of 14 Oct 22:28 (post_rules.apply_v8_rules / apply_adverse_triggers)
++    "V8_D1": True,   # (vii)(a) delays / exception stated, no arrears -> Qualified (D-1)
++    "V8_D1B": True,  # (vii)(a) "generally regular", no delay, no arrears, model said Qualified -> Favourable (truth convention)
++    "V8_D2": True,   # (xx)(b) named "not applicable" in the CSR passage, no text of its own -> Not Applicable (D-2)
++    "V8_D3": True,   # incomplete answer on the point's own subject -> Qualified (D-3)
++    "V8_D13": True,  # (v) deposits accepted, provisions "applicable", no compliance stated -> Qualified (D13)
++    "V8_CUT": True,  # a sub-point whose copied text stops at ":" -> Adverse triggers also read the clause passage
+     "RECHECK_GUARD": True,     # the recheck reply is capped (RECHECK_MAX_TOKENS) and a network error / timeout in the recheck keeps the first answers instead of failing the filing        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+--- v7/caro/post_rules.py
++++ v8/caro/post_rules.py
+@@ -1032,6 +1032,24 @@
+                     sent = R_ARREARS_LISTED.hit(mtxt)
+                     if sent:
+                         hit = (R_ARREARS_LISTED, sent, True)
++            if hit is None and level == "sub" and rec.get("_staged") and _patch_on("V8_CUT") \
++                    and re.search(r":\s*$", (real_text(nf.get("source_text")) or "").strip()):
++                # PATCH 14-Oct-2026 (v8, V8_CUT): the copied answer stops at a heading ("... taken from Bank:") - read the
++                # clause passage too, minus every sibling's own text (Ichalkaranji 2022-23 (ix)(a): the NPA statement)
++                mnf = r.get("normalized_fields") if isinstance(r.get("normalized_fields"), dict) else {}
++                mtxt = strip_labels(real_text(mnf.get("source_text")) or "")
++                sib = [strip_labels(real_text((s.get("normalized_fields") or {}).get("source_text")) or "")
++                       for s in subs if s is not rec]
++                for t_ in sib:
++                    if len(t_) >= 20 and t_ in mtxt:
++                        mtxt = mtxt.replace(t_, " ")
++                if mtxt:
++                    for rule in rules + ([R_NPA_CUT] if uid in ("ix_a", "viii") else []):
++                        sent = rule.hit(mtxt)
++                        if sent and not any(sent[:80] in t_ for t_ in sib if t_):
++                            hit = (rule, sent, True)
++                            rec["v8_cut_read_passage"] = True
++                            break
+             if hit is None and uid == "xvii" and rec.get("_staged") and _patch_on("F33"):          # PATCH 13-Oct-2026 (F33)
+                 sent = cash_loss_with_amount(text)
+                 if sent:
+@@ -3404,6 +3422,225 @@
+             except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
+                 continue
+     return out
++
++
++# ===========================================================================
++# PATCH 14-Oct-2026 (v8). Toby's decisions of 14 Oct 2026, 22:28 IST, as code rules on each unit's own
++# text, after the model and after v7, before the roll-up. Two-call records only; the single flow is untouched.
++#   D-1  (vii)(a): the auditor states DELAYS (or an exception) in depositing undisputed dues and no arrears
++#        over six months -> Qualified. "Generally regular" with NO delay stated stays Favourable: the reviewed
++#        truth holds 39 confirmed Favourable rows with that wording (V8_D1B applies that convention when the
++#        model said Qualified).
++#   D-2  (xx)(b): the CSR passage NAMES (xx)(b) (or "clause (xx)") as not applicable and (xx)(b) has no text
++#        of its own -> Not Applicable (rule F10a gave Not Reported).
++#   D-3  an answer on the point's OWN subject that leaves out the fact the question asks for -> Qualified:
++#        (i)(c) title deeds "disclosed in the financial statements" with no word on whose name; (iii)(a)(A)/(B)
++#        loans granted but no amounts given; (iii)(c) loans repayable on demand with no repayment schedule;
++#        (xiv)(a)/(b) internal audit required but not appointed, stated only in the clause passage.
++#   D13  (v): deposits accepted (e.g. from credit co-operative societies), the auditor says ss.73-76 "are
++#        applicable" and never says they were complied with -> Qualified.
++#   V8_CUT (apply_adverse_triggers): a sub-point whose own text ends in ":" (the copied answer stops at a
++#        heading) is also read with its clause passage, minus every sibling's own text, for the Adverse triggers
++#        (Ichalkaranji 2022-23 (ix)(a): "... has not defaulted for repayment of term loan taken from Bank:"; the
++#        NPA statement follows in the passage).
++# Never changes: an Adverse; an Auditor Unable to Verify; a label set by an agreed code rule (v7 keep list),
++# except that D-2 may replace F10a's Not Reported on (xx)(b) and v8 may refine a v7 label (later decision).
++# One rule per unit. Every change is in the audit file under "v8_rule". Each rule has its own switch
++# (staged_llm.PATCH_SWITCHES V8_D1, V8_D1B, V8_D2, V8_D3, V8_D13, V8_CUT); all off = v7 output, byte-identical.
++# ===========================================================================
++_V8_KEEP_KEYS = tuple(k for k in _V7_KEEP_KEYS)
++# used ONLY by V8_CUT (a (ix)(a) answer cut at a heading): an account that BECAME an NPA is a default (ix)(a)
++R_NPA_CUT = _Rule("ADV_DEFAULT_REPAYMENT_NPA",
++                  r"(?:became|become|has\s+become|have\s+become|classified\s+as|declared\s+as)\s+(?:an?\s+)?(?:NPA|non[-\s]?performing\s+assets?)\b",
++                  r"\b(?:no|not|never|none)\b[^.]{0,40}(?:NPA|non[-\s]?performing)",
++                  description="Default or irregular repayment of borrowings to lenders (account became an NPA)")
++_V8_CSR_KEYS = ("csr_spent_rule", "csr_scan", "csr_combined_ab")
++
++_V8_DELAY = re.compile(
++    r"\bdelays?\s+in\s+(?:a\s+|the\s+)?(?:few|some|certain|large|number|many|several)\b"
++    r"|\bthere\s+(?:has|have)\s+been\s+(?:a\s+|an\s+)?(?:[a-z]+\s+){0,3}delays?\b"
++    r"|\bexcept\s+(?:that\s+|for\s+)?(?:there\s+(?:has|have)\s+been\s+)?(?:some|few|certain|minor|slight)\s+"
++    r"(?:cases|instances|variations?|delays?)\b"
++    r"|\bexcept\s+some\s+variation\b"
++    r"|\b(?:slight|minor|occasional|serious)\s+delays?\b", re.I)
++_V8_NODELAY = re.compile(r"\b(?:no|without(?:\s+any)?)\s+(?:material\s+|significant\s+)?delays?\b|"
++                         r"\bnot\s+been\s+any\s+delays?\b", re.I)
++_V8_HEDGE = re.compile(r"\bgenerally\s+(?:been\s+)?regular", re.I)
++_V8_NO_ARREARS = re.compile(
++    r"\bno\s+(?:undisputed\s+)?(?:statutory\s+)?(?:amounts?|dues|arrears|sums?)\b[^.]{0,300}?(?:outstanding|in\s+arrears|"
++    r"payable|arrears)[^.]{0,250}?(?:six|6)\s+months|\bno\s+arrears\b|\bno\s+statutory\s+undisputed\s+dues\s+outstanding\b|"
++    r"\bno\s+undisputed\s+(?:amounts?|dues)[^.]{0,200}(?:six|6)\s+months", re.I)
++_V8_BADWORD = re.compile(r"\bexcept\b|\bhowever\b|\bbut\b|\bdelay|\bnot\s+(?:been\s+)?(?:regular|deposited|paid)|"
++                         r"\birregular|\bdefault|\bvariation|\barrears\s+(?:as\s+(?:at|on)|of)\b[^.]{0,40}\d", re.I)
++
++
++def _v8_d1(uid, lab, own, ed) -> Optional[tuple]:
++    if uid != "vii_a" or not own:
++        return None
++    if lab in ("FAV", "NA"):
++        for s in _sentences(own):
++            m = _V8_DELAY.search(s)
++            if m and not _V8_NODELAY.search(s):
++                return "QUAL", s.strip()[:300]
++    return None
++
++
++def _v8_d1b(uid, lab, own, ed) -> Optional[tuple]:
++    if uid != "vii_a" or not own or lab != "QUAL":
++        return None
++    if _V8_HEDGE.search(own) and _V8_NO_ARREARS.search(own) and not _V8_BADWORD.search(own) \
++            and not _V8_DELAY.search(own):
++        return "FAV", _V8_HEDGE.search(own).group(0)
++    return None
++
++
++_V8_XX_NA = re.compile(
++    r"(?:3\s*)?\(\s*xx\s*\)\s*\(\s*a\s*\)\s*(?:and|&|,)\s*(?:3\s*)?(?:\(\s*xx\s*\)\s*)?\(\s*b\s*\)[^.]{0,120}?not\s+applicable"
++    r"|clause\s*(?:3\s*)?\(?\s*xx\s*\)?(?:\s+of\s+(?:the\s+)?paragraph\s*3)?(?:\s+of\s+(?:the\s+)?(?:said\s+)?order)?\s+"
++    r"(?:is|are)\s+not\s+applicable", re.I)
++
++
++def _v8_d2(main_src: str) -> Optional[str]:
++    for s in _sentences(main_src or ""):
++        if _V8_XX_NA.search(s) and not re.search(r"\bexcept\b|\bother\s+than\b|\bhowever\b", s, re.I):
++            return s.strip()[:300]
++    return None
++
++
++_V8_AMOUNT = re.compile(r"\b(?:rs\.?|inr)\s*\d[\d,]*|₹\s*\d|\b\d{1,3}(?:,\d{2,3}){1,}\b|\b\d+\.\d{2}\b|\b\d{5,}\b|"
++                        r"\blakhs?\b|\bcrores?\b|\bin\s+thousands?\b", re.I)     # a figure; a year ("Act, 2013") is not one
++_V8_GRANT = re.compile(r"\b(?:has|have)\s+(?:also\s+)?(?:granted|provided|given|made|advanced)\s+(?:any\s+)?(?:loans?|advances?|"
++                       r"guarantees?|security|investments?)", re.I)
++_V8_HEAD = re.compile(r"hence\s+commented\s+upon|(?:are|is)\s+applicable|as\s+follows\s*:|following[^.:]{0,80}:", re.I)
++_V8_DEEDS_NAME = re.compile(r"in\s+the\s+name\s+of|company'?s\s+name|name\s+of\s+the\s+company|held\s+in\s+(?:its|their)\s+name|"
++                            r"held\s+in\s+the\s+name", re.I)
++
++
++def _v8_grant_stated(main_src: str) -> Optional[str]:
++    for s in _sentences(main_src or ""):
++        m = _V8_GRANT.search(s)
++        if m and not _V7_NEGLEAD.search(s[:m.start()][-60:]) and not re.search(r"\bnot\b", s[m.start():m.end()], re.I):
++            return s.strip()
++    return None
++
++
++def _v8_d3(uid, lab, own, main_src, ed) -> Optional[tuple]:
++    if ed != 2020:
++        return None
++    if uid == "i_c" and lab == "FAV" and own:
++        if re.search(r"title\s+deeds?", own, re.I) and re.search(r"disclosed\s+in\s+(?:the\s+)?financial\s+statements?", own, re.I) \
++                and not _V8_DEEDS_NAME.search(own) and not re.search(r"\bnot\b|\bno\b|\bexcept\b|\bother\s+than\s+(?:those|the)\b", own, re.I):
++            return "QUAL", own.strip()[:300]
++        return None
++    if uid in ("iii_a_a", "iii_a_b") and lab == "NR" and own and own.rstrip().endswith(":") \
++            and not _V8_AMOUNT.search(own) and not _V7_NEGLEAD.search(own):
++        own = ""         # only the printed question + a heading with nothing after it (K.R. Foods 2024-25: "The Following
++        #                  Loan & Advances are Repayment on Demand:") - a dangling disclosure, read like a point with no text
++    if own:
++        return None                                            # the rules below read only points with no text of their own
++    if uid in ("iii_a_a", "iii_a_b") and lab in ("NR", "NA"):
++        g = _v8_grant_stated(main_src)
++        if g and _V8_HEAD.search(main_src) and not _V8_AMOUNT.search(main_src):
++            return "QUAL", g[:300]
++        return None
++    if uid == "iii_c" and lab == "NR":
++        g = _v8_grant_stated(main_src)
++        if g and re.search(r"repay(?:ment|able)\s+on\s+demand", main_src, re.I) and not re.search(r"stipulat|schedule", main_src, re.I):
++            return "QUAL", g[:300]
++        return None
++    if uid in ("xiv_a", "xiv_b") and lab == "NR":
++        m = _V7_IA_NOT.search(main_src or "")
++        if m and not _V7_IA_NOTREQ.search(main_src) and not re.search(r"\bhowever\b|commensurate", main_src, re.I):
++            return "QUAL", main_src[max(0, m.start() - 160):m.end() + 40].strip()
++    return None
++
++
++_V8_DEP_TAKEN = re.compile(r"\bexcept\b[^.]{0,120}co-?\s*operative\s+(?:credit\s+)?societ|(?:has|have)\s+accepted\s+(?:the\s+)?"
++                           r"(?:deposits?|loans?)\s+from[^.]{0,80}co-?\s*operative", re.I)
++
++
++def _v8_d13(uid, lab, own, ed) -> Optional[tuple]:
++    if uid != "v" or lab not in ("FAV", "NA") or not own:
++        return None
++    m = _V8_DEP_TAKEN.search(own)
++    if m and re.search(r"(?:are|is)\s+applicable", own, re.I) and not re.search(r"compli|complied|in\s+accordance\s+with", own, re.I):
++        return "QUAL", own.strip()[:300]
++    return None
++
++
++_V8_WHY = {"D1": "the auditor states delays (or an exception) in depositing undisputed statutory dues (decision D-1)",
++           "D1B": "'generally regular' with no delay and no arrears over six months stated (reviewed-truth convention)",
++           "D2": "the auditor states for the CSR clause that (xx)(b) is not applicable (decision D-2)",
++           "D3": "the auditor answers this point's own subject but leaves out the fact the question asks for (decision D-3)",
++           "D13": "deposits accepted, the provisions are stated to be applicable, compliance is not stated (decision D13)"}
++
++
++def apply_v8_rules(records: list, order_year) -> list:
++    """PATCH 14-Oct-2026 (v8). Called from pipeline.assemble_document after apply_v7_rules, before the roll-up.
++    Returns [(unit, rule, from, to)]. Never raises."""
++    out = []
++    try:
++        ed = 2016 if _edition(order_year) == 2016 else 2020
++    except Exception:                                          # noqa: BLE001
++        return out
++    for r in records or []:
++        if not isinstance(r, dict):
++            continue
++        main_id = str(r.get("main_clause_id", "")).strip().lower().strip("()")
++        subs = [s for s in (r.get("sub_clauses") or []) if isinstance(s, dict)]
++        mnf = r.get("normalized_fields") if isinstance(r.get("normalized_fields"), dict) else {}
++        main_src = strip_labels(real_text(mnf.get("source_text")) or "") if subs else ""
++        for rec, level in ([(s, "sub") for s in subs] or [(r, "main")]):
++            try:
++                if not rec.get("_staged"):
++                    continue
++                uid = _unit_id(rec, level, main_id).lower()
++                csr_ok = uid == "xx_b" and ed == 2020
++                keys = [k for k in _V8_KEEP_KEYS if rec.get(k)]
++                if keys and not (csr_ok and all(k in _V8_CSR_KEYS for k in keys)):
++                    continue
++                cls = rec.get("classification")
++                if cls == "qualified" and rec.get("scope_limited"):
++                    continue                                   # Auditor Unable to Verify stays
++                lab = _V7_LABEL.get(cls)
++                if lab in (None, "ADV"):
++                    continue
++                nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++                own = strip_labels(real_text(nf.get("source_text")) or "")
++                if own.lower().startswith("(from main clause)"):
++                    own = ""
++                g, rid = None, None
++                if _patch_on("V8_D2") and csr_ok and lab == "NR" and not own and main_src:
++                    w = _v8_d2(main_src)
++                    if w:
++                        g, rid = ("NA", w), "D2"
++                if g is None and keys:
++                    continue                                   # only D-2 may replace an agreed rule's label (F10a)
++                if g is None and _patch_on("V8_D1"):
++                    g = _v8_d1(uid, lab, own, ed); rid = "D1" if g else None
++                if g is None and _patch_on("V8_D1B"):
++                    g = _v8_d1b(uid, lab, own, ed); rid = "D1B" if g else None
++                if g is None and _patch_on("V8_D13"):
++                    g = _v8_d13(uid, lab, own, ed); rid = "D13" if g else None
++                if g is None and _patch_on("V8_D3"):
++                    g = _v8_d3(uid, lab, own, main_src, ed); rid = "D3" if g else None
++                if not g or g[0] == lab:
++                    continue
++                new, words = g
++                info = {"rule": rid, "from_label": lab, "to_label": new, "words": (words or "")[:300], "why": _V8_WHY[rid]}
++                lead = {"FAV": "Favourable", "NA": "Not applicable", "QUAL": "Qualified"}[new]
++                if rid == "D3" and not own:
++                    expl = (lead + " — the auditor's answer on this point is incomplete; the clause passage reads: \""
++                            + (words or "")[:300] + "\"")
++                else:
++                    expl = lead + " — the auditor reports: \"" + (words or "")[:300] + "\""
++                _p1_set_label(rec, _V7_CLS[new], "v8_rule", info, expl, None)
++                if new == "QUAL":
++                    _add_reason(rec, "v8_decision_" + rid)
++                out.append((uid, rid, lab, new))
++            except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
++                continue
++    return out
+ 
+ 
+ def run_phase1(records: list, caro_text: str, order_year) -> dict:
+--- v7/caro/pipeline.py
++++ v8/caro/pipeline.py
+@@ -760,7 +760,8 @@
+                   "going_concern_from_main_report", "na_pushed_from_main", "inherited_from_main",
+                   "xvi_rule", "csr_spent_rule", "iv_contradiction_rule",      # PATCH 7-Oct (Phase 1): F10a, F10b
+                   "blanket_na_rule",                                          # PATCH 7-Oct (Phase 1b): D08
+-                  "v7_rule")                                                  # PATCH 14-Oct-2026 (v7)
++                  "v7_rule",                                                  # PATCH 14-Oct-2026 (v7)
++                  "v8_rule")                                                  # PATCH 14-Oct-2026 (v8)
+ 
+ 
+ def _quote_for(rec: dict, n: int = 300) -> str:
+@@ -1191,6 +1192,14 @@
+             logger.info("[v7] %d label(s) set by convention rules: %s", len(_v7), _v7)
+     except Exception as e:                                        # never break extraction
+         logger.warning("[v7] skipped (%s)", e)
++    # PATCH 14-Oct-2026 (v8): Toby's decisions D-1, D-2, D-3, D13 (post_rules.apply_v8_rules)
++    try:
++        from .post_rules import apply_v8_rules
++        _v8 = apply_v8_rules(records, getattr(doc, "caro_order_year", None))
++        if _v8:
++            logger.info("[v8] %d label(s) set by decision rules: %s", len(_v8), _v8)
++    except Exception as e:                                        # never break extraction
++        logger.warning("[v8] skipped (%s)", e)
+     for r in records:
+         _rollup(r)
+     _oy = getattr(doc, "caro_order_year", None)
+--- v7/caro/audit.py
++++ v8/caro/audit.py
+@@ -68,7 +68,9 @@
+               # PATCH 13-Oct-2026 (Option C): a code rule did not soften the model's label (unit's own text disagreed)
+               "own_text_kept",
+               # PATCH 14-Oct-2026 (v7): convention rule (group, from, to, the auditor's words)
+-              "v7_rule")
++              "v7_rule",
++              # PATCH 14-Oct-2026 (v8): decision rule (D-1, D-2, D-3, D13), and the V8_CUT passage read
++              "v8_rule", "v8_cut_read_passage")
+ 
+ _LOCK = threading.Lock()
+ 
+@@ -167,6 +169,10 @@
+         acts.append("xvi_not_nbfc_set_not_applicable")
+     if rec.get("v7_rule"):
+         acts.append("v7_convention_rule_" + str((rec.get("v7_rule") or {}).get("group", "")))
++    if rec.get("v8_rule"):
++        acts.append("v8_decision_rule_" + str((rec.get("v8_rule") or {}).get("rule", "")))
++    if rec.get("v8_cut_read_passage"):
++        acts.append("v8_cut_answer_read_with_clause_passage")
+     if rec.get("na_pushed_from_main"):
+         acts.append("not_applicable_passed_down_from_main_clause")
+     if rec.get("derived_from_document"):
+--- v7/tests/run_phase2_cases.py
++++ v8/tests/run_phase2_cases.py
+@@ -2801,6 +2801,96 @@
+       and all(b == "Not Reported by Auditor" for _a, b in _d7.values())
+       and flat(_t7)["xiii"]["classification"] == flat(_t1)["xiii"]["classification"], (_d7, flat(_t7)["xiii"]["classification"]))
+ 
++# ---------------------------------------------------------------------------
++# PATCH 14-Oct-2026 (v8): Toby's decisions D-1, D-2, D-3, D13 and the cut-off rule (post_rules.apply_v8_rules,
++# apply_adverse_triggers V8_CUT). Real wording from the filings named.
++# ---------------------------------------------------------------------------
++_d1 = ("(vii)(a) Undisputed statutory dues including goods and services tax, provident fund ... have generally been regularly "
++       "deposited with the appropriate authorities though there has been a slight delay in a few cases. According to the "
++       "information and explanations given to us, no undisputed amounts payable in respect of these statutory dues were "
++       "outstanding, at the year end, for a period of more than six months from the date they became payable.")
++_hedge = ("(a) According to the books and records produced and examined by us, the Company is generally regular in depositing "
++          "undisputed Statutory dues including Provident Fund, Employees' State Insurance, Income Tax, Goods and Services Tax "
++          "(GST), Cess and other material statutory dues as applicable with the appropriate authorities and no undisputed "
++          "amount payable in respect of aforesaid statutory dues were outstanding as at March 31, 2022 for a period of more "
++          "than six months from the date they become payable.")
++_v8r = lambda recs: (pr.apply_v8_rules(recs, 2022), recs)[1]
++_s8 = _v7("vii", {"vii_a": ("clean", _d1)}, staged=False); _s80 = _cp7.deepcopy(_s8); pr.apply_v8_rules(_s8, 2022)
++check("V8-0 (rollback + single flow) every v8 rule has its own switch, shipped ON; a single-flow record is never touched; "
++      "an Adverse and an Auditor Unable to Verify are never changed",
++      all(_SHIPPED.get(g) is True for g in ("V8_D1", "V8_D1B", "V8_D2", "V8_D3", "V8_D13", "V8_CUT")) and _s8 == _s80
++      and _lab7(_v8r(_v7("vii", {"vii_a": ("adverse", _d1)})), "vii_a") == "adverse"
++      and _lab7(_v8r(_v7("vii", {"vii_a": ("qualified", _hedge)}, scope_limited=True)), "vii_a") == "qualified+scope")
++check("V8-1 (D-1) (vii)(a) delays stated, no arrears -> Qualified (Aditya 2022-23); 'without any delay' and 'generally "
++      "regular ... no arrears' (U15421PN2006, 39 confirmed Favourable rows) stay Favourable",
++      _lab7(_v8r(_v7("vii", {"vii_a": ("clean", _d1)})), "vii_a") == "qualified"
++      and _lab7(_v8r(_v7("vii", {"vii_a": ("clean", "The Company has been regular in depositing undisputed statutory dues "
++                                            "without any delay with the appropriate authorities.")})), "vii_a") == "clean"
++      and _lab7(_v8r(_v7("vii", {"vii_a": ("clean", _hedge)})), "vii_a") == "clean")
++check("V8-2 (D-1, reviewed-truth convention) 'generally regular' + no arrears, NO delay, model said Qualified -> "
++      "Favourable; the same with a delay stated stays Qualified",
++      _lab7(_v8r(_v7("vii", {"vii_a": ("qualified", _hedge)})), "vii_a") == "clean"
++      and _lab7(_v8r(_v7("vii", {"vii_a": ("qualified", _d1)})), "vii_a") == "qualified")
++_xxm = ("(xx) There are no unspent amounts that are required to be transferred to a fund specified in Schedule VII of the "
++        "Companies Act, 2013 within a period of six months of the expiry of the financial year, in compliance with second "
++        "proviso to sub-section 5 of section 135 of the Act. Accordingly, clauses 3(xx)(a) and 3(xx)(b) of the Order are "
++        "not applicable.")
++_x2 = _v8r(_v7("xx", {"xx_a": ("clean", "There are no unspent amounts ..."), "xx_b": ("insufficient_evidence", "-")}, _xxm))
++_x2b = _v7("xx", {"xx_b": ("insufficient_evidence", "-")}, _xxm); _x2b[0]["sub_clauses"][0]["csr_spent_rule"] = {"x": 1}
++_v8r(_x2b)
++_x2c = _v8r(_v7("xx", {"xx_b": ("clean", "there is no unspent amount under sub-section (5) of Section 135 pursuant to any project.")}, _xxm))
++check("V8-3 (D-2) (xx)(b) with no text of its own, the CSR passage naming 3(xx)(a) and 3(xx)(b) not applicable -> Not "
++      "Applicable, also over rule F10a's Not Reported (U15421PN2006 2021-22); (xx)(b) with its own answer (Starlite) is "
++      "untouched",
++      _lab7(_x2, "xx_b") == "not_applicable" and _lab7(_x2b, "xx_b") == "not_applicable" and _lab7(_x2c, "xx_b") == "clean")
++_ic = ("The title deeds of all the immovable properties (other than properties where the company is the lessee and the lease "
++       "agreements are duly executed in favour of the lessee) are disclosed in financial statement.")
++_krf = ("As per the information and explanations given to us, the Company has granted loans, secured or unsecured to companies, "
++        "firms or other parties covered in the register maintained under section 189 of the Act. Accordingly, the provisions "
++        "of clause3(iii)(a) to (f) of the Order are applicable to the company and hence commented upon: The Loans and "
++        "Advances are not prejudicial to the Interest of the Company. The Following Loans & Advances are repayment on Demand : "
++        "The Loans & Advances are repayment on Demand, therefore noamount overdue at year end.")
++_ia = ("xiv) According to section 138(1) of the Companies Act, 2013 company is fall under the category for appointment of an "
++       "internal auditor. The company has not appointed internal auditor.")
++check("V8-4 (D-3) incomplete answers on the point's own subject -> Qualified: (i)(c) deeds 'disclosed in financial "
++      "statement' (Ichalkaranji); (iii)(a)(A)/(B) and (iii)(c) loans granted, no amounts / demand loans (K.R. Foods "
++      "2021-22); (xiv)(b) internal auditor required, not appointed (Ichalkaranji 2022-23). Kept: deeds 'held in the name "
++      "of the Company'; (iii)(a) with amounts given",
++      _lab7(_v8r(_v7("i", {"i_c": ("clean", _ic)})), "i_c") == "qualified"
++      and _lab7(_v8r(_v7("i", {"i_c": ("clean", "The title deeds of all the immovable properties disclosed in the "
++                                       "financial statements are held in the name of the Company.")})), "i_c") == "clean"
++      and _lab7(_v8r(_v7("iii", {"iii_a_A": ("insufficient_evidence", "-")}, _krf)), "iii_a_A") == "qualified"
++      and _lab7(_v8r(_v7("iii", {"iii_c": ("insufficient_evidence", "-")}, _krf)), "iii_c") == "qualified"
++      and _lab7(_v8r(_v7("iii", {"iii_a_A": ("insufficient_evidence", "-")}, _krf + " The aggregate amount is Rs. 12,50,000.")),
++                "iii_a_A") == "insufficient_evidence"
++      and _lab7(_v8r(_v7("xiv", {"xiv_b": ("insufficient_evidence", "-")}, _ia)), "xiv_b") == "qualified")
++_dep = ("v) The company has not accepted any deposits from the public except four Credit cooperative societies of Rs. 7383 "
++        "thousand and hence the directives issued by the Reserve Bank of India and the provisions of Sections 73 to 76 or any "
++        "other relevant provisions of the Act and the Companies (Acceptance of Deposit) Rules, 2015 with regard to the "
++        "deposits accepted from the public are applicable.")
++check("V8-5 (D13) (v) deposits from credit co-operative societies, provisions 'applicable', no compliance stated -> "
++      "Qualified (Ichalkaranji 2022-23); a compliance statement keeps it Favourable",
++      _lab7(_v8r(_v7("v", None, _dep, cls="not_applicable")), "v") == "qualified"
++      and _lab7(_v8r(_v7("v", None, _dep + " The Company has complied with the said provisions.", cls="clean")), "v") == "clean")
++_ixm8 = ("(a) In our opinion and according to the information and explanations given to us, and based on scrutiny of accounts "
++         "the Company has not defaulted for repayment of term loan taken from Bank: (b) The company is not declared as willful "
++         "defaulter by any bank or financial institution or other lender. However, the credit facilities sanctioned by banks "
++         "Following Banks having outstanding of Rs. 906087 thousand including interest is became NPA.")
++_cut = _v7("ix", {"ix_a": ("clean", "(a) In our opinion and according to the information and explanations given to us, and "
++                                    "based on scrutiny of accounts the Company has not defaulted for repayment of term loan "
++                                    "taken from Bank:"),
++                  "ix_b": ("clean", "(b) The company is not declared as willful defaulter by any bank or financial "
++                                    "institution or other lender.")}, _ixm8)
++pr.apply_adverse_triggers(_cut, 2022, set())
++_cut2 = _v7("ix", {"ix_a": ("clean", "(a) The Company has not defaulted in repayment of term loan taken from Bank."),
++                   "ix_b": ("clean", "(b) not declared wilful defaulter.")}, _ixm8)
++pr.apply_adverse_triggers(_cut2, 2022, set())
++check("V8-6 (V8_CUT) a sub-point whose copied answer stops at ':' is read with its clause passage, minus its siblings' own "
++      "text: Ichalkaranji 2022-23 (ix)(a) '... taken from Bank:' + 'became NPA' -> Adverse; a complete answer is not "
++      "re-read (stays Favourable); (ix)(b) untouched",
++      _lab7(_cut, "ix_a") == "adverse" and _lab7(_cut, "ix_b") == "clean" and _lab7(_cut2, "ix_a") == "clean",
++      (_lab7(_cut, "ix_a"), _lab7(_cut2, "ix_a")))
++
+ urllib.request.urlopen = _real_urlopen
+ n_ok = sum(ok for _n, ok in RESULTS)
+ print(f"\n{n_ok}/{len(RESULTS)} Phase 2 checks passed")

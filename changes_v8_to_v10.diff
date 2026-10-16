@@ -1,0 +1,1768 @@
+--- a/caro/amounts.py
++++ b/caro/amounts.py
+@@ -78,6 +78,19 @@
+                          r"|(?:rs\.?|₹|inr)\s*in\s*" + _UNIT_WORD +
+                          r"|\bin\s+(?:rupees|rs\.?|inr|₹)\s+" + _UNIT_WORD + r"\b"
+                          r"|\(\s*(?:rs\.?|₹|inr)\s*\)\s*" + _UNIT_WORD + r"\b", re.I)
++# v10 (15-Oct-2026), switch HEADING_RS_PAREN: the heading "Rs.( Lakh)" / "Rs. ( Crore )" -- a currency sign
++# followed by the unit in brackets. Missed before, so K C India's disputed income tax "149.23" under "Rs.( Lakh)"
++# was shown as Rs 149.23 instead of Rs 1,49,23,000.
++_HEADING_RS_PAREN = re.compile(r"(?:rs\.?|₹|inr)\s*\(\s*" + _UNIT_WORD + r"\s*\)", re.I)
++
++
++def _heading_hits(seg: str) -> list:
++    hits = list(_HEADING.finditer(seg)) or list(_HEADING_SPLIT.finditer(seg))
++    if not hits and amt_switch_on("HEADING_RS_PAREN"):
++        hits = list(_HEADING_RS_PAREN.finditer(seg))
++    return hits
++
++
+ # PATCH 7-Oct (Phase 1, F15) -- a grouped figure is read to its end.
+ # WHY: western grouping with two or more commas ("3,716,124") was read as "3,716"
+ # (the Indian-grouping pattern matched first and stopped early). The figure was
+@@ -115,6 +128,8 @@
+     m = _HEADING.search(text or "")
+     if not m:
+         m = _HEADING_SPLIT.search(text or "")
++    if not m and amt_switch_on("HEADING_RS_PAREN"):
++        m = _HEADING_RS_PAREN.search(text or "")
+     if not m:
+         return 1.0
+     return _mult(next(g for g in m.groups() if g))
+@@ -243,7 +258,7 @@
+     marks = [m.start() for m in _WIN_MARK_RE.finditer(seg)]
+     if marks:
+         seg = seg[marks[-1]:]
+-    hits = list(_HEADING.finditer(seg)) or list(_HEADING_SPLIT.finditer(seg))
++    hits = _heading_hits(seg)
+     if not hits:
+         return 1.0
+     return _mult(next(g for g in hits[-1].groups() if g))
+@@ -289,7 +304,7 @@
+     for mm in _MAIN_MARK.finditer(full_text, 0, pos):
+         start = mm.start()
+     seg = full_text[max(start, pos - 6000):pos]
+-    hits = list(_HEADING.finditer(seg)) or list(_HEADING_SPLIT.finditer(seg))
++    hits = _heading_hits(seg)
+     if not hits:
+         return None
+     return _mult(next(g for g in hits[-1].groups() if g))
+@@ -730,6 +745,8 @@
+     "OWN_CLAUSE_ONLY": True,  # a figure must be printed in this clause's own passage (not another clause's)
+     "ALL_FALSE_RECOVER": True,  # 13-Oct trial run: every figure marked "not counted" -> the code checks decide
+     "NOT_QTY": True,  # v6 (14-Oct): a figure followed by shares / numbers / % / days / months / years is never rupees
++    "TABLE_ABSOLUTE": True,  # v10 (15-Oct, Toby): disputed_dues_table[].amount shown in absolute rupees, like amount_total
++    "HEADING_RS_PAREN": True,  # v10 (15-Oct): the heading "Rs.( Lakh)" is a unit heading (K C India: 149.23 = Rs 1.49 crore)
+ }
+ 
+ 
+@@ -1929,3 +1946,117 @@
+             r.pop("_clause_src", None)
+             r.pop("_other_src", None)
+     return changed
++
++
++# ===========================================================================
++# RULE TABLE_ABSOLUTE (v10, Toby 15-Oct-2026): every row of disputed_dues_table shows its amount in absolute
++# rupees, the same way amount_total does. Example (Apollo 2024-25 (vii)): the auditor prints "22.95*" and
++# "185.59*" under "(Rs. in lakhs)" -> 2295000.0 and 18559000.0 (amount_total 20854000.0).
++# How a row's figure is converted, first match wins:
++#   1. the same printed figure was already converted for amount_total (amount_calc items of the unit or of its
++#      sub-clauses) -> that value, so the rows always agree with amount_total;
++#   2. a unit printed in the cell ("12.5 lakh") or a figure written in full rupees ("15,410/-", "1,00,65,542");
++#   3. the unit heading of the table the figure is printed in ("(Rs. in lakhs)"), or a unit word right after it;
++#   4. a whole number with no heading anywhere -> rupees as printed.
++# A decimal figure whose unit cannot be found is NOT guessed: the row keeps the auditor's text and the unit is
++# sent for review (review reason table_amount_unit_unclear) - the same rule as amount_total (F15).
++# Runs after apply_amounts; nothing reads the row text after this point. Switch: AMOUNT_SWITCHES["TABLE_ABSOLUTE"].
++# ===========================================================================
++_PERIOD = re.compile(r"(?:19|20)\d{2}\s*[-–/]\s*(?:19|20)?\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*,?\s*"
++                     r"(?:19|20)\d{2}\b|\b(?:AY|A\.Y\.?|FY|F\.Y\.?|assessment\s+year|financial\s+year)\s*(?:19|20)\d{2}(?:\s*[-–/]\s*(?:19|20)?\d{2})?", re.I)
++
++
++def _money_figures(cell: str) -> list:
++    """The money figures printed in one table cell: periods ("2011-12", "AY 2018-19", "November 2014") and bare
++    years are not money. "Rs. 20,95,74,867 and Rs. 1,00,65,542" -> two figures."""
++    t = _PERIOD.sub(" ", str(cell))
++    out = []
++    for m in _FIG.finditer(t):
++        n = m.group("num").replace(",", "")
++        if re.fullmatch(r"(?:19|20)\d\d", n) and not (m.group("cur") or m.group("unit") or m.group("dash")):
++            continue
++        out.append(m.group(0).strip())
++    return out
++
++
++def _one_figure(printed, pool: list, quote: str, full_text: str):
++    m = _FIG.search(str(printed))
++    if not m:
++        return None
++    num = m.group("num").replace(",", "")
++    for p, v in pool:                                            # 1. same figure as amount_total used
++        mm = _FIG.search(str(p or ""))
++        if mm and v and mm.group("num").replace(",", "") == num:
++            return float(v)
++    nm = m.group("num")
++    if m.group("unit") or m.group("dash") or (nm.count(",") >= 2 and "." not in nm) or (m.group("cur") and "." not in nm):
++        return to_rupees(printed, 1.0)                           # 2. unit in the cell / full rupees
++    pos = locate_figure(printed, quote, full_text) if full_text else -1
++    mult = inline_unit(full_text, pos, m.group("num")) if pos >= 0 else None
++    if not mult and full_text:
++        mult = _heading_for_figure(printed, quote, full_text, _WINDOW, pos)
++    if mult and mult != 1.0:
++        return to_rupees(printed, mult)                          # 3. table heading / unit word
++    if "." not in nm:
++        return to_rupees(printed, 1.0)                           # 4. whole number, no heading: rupees
++    return None
++
++
++def _row_rupees(cell, pool: list, quote: str, full_text: str):
++    """Absolute rupees for one cell (several figures in one cell are added), or None when any figure's unit is
++    unclear or the cell holds no money figure."""
++    figs = _money_figures(cell)
++    if not figs:
++        return None
++    vals = [_one_figure(f, pool, quote, full_text) for f in figs]
++    if any(v is None for v in vals):
++        return None
++    return sum(vals)
++
++
++def absolute_table_amounts(records: list, caro_text: Optional[str]) -> dict:
++    """Convert disputed_dues_table[].amount to absolute rupees (see the block comment above). Never raises."""
++    out = {"converted": 0, "unclear": 0}
++    if not amt_switch_on("TABLE_ABSOLUTE"):
++        return out
++    text = caro_text or ""
++
++    def items(rec):
++        return [(i.get("as_printed"), i.get("rupees")) for i in ((rec or {}).get("amount_calc") or {}).get("items") or []]
++    for r in records or []:
++        if not isinstance(r, dict):
++            continue
++        subs = [x for x in (r.get("sub_clauses") or []) if isinstance(x, dict)]
++        sub_pool = [it for x in subs for it in items(x)]
++        for rec in [r] + subs:
++            try:
++                nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++                rows = nf.get("disputed_dues_table") or []
++                if not rows:
++                    continue
++                pool = items(rec) + (sub_pool if rec is r else items(r))
++                quote = str(nf.get("source_text") or rec.get("evidence_text") or "")
++                unclear = []
++                for row in rows:
++                    if not isinstance(row, dict):
++                        continue
++                    a = row.get("amount")
++                    if a is None or isinstance(a, bool) or isinstance(a, (int, float)):
++                        continue
++                    if re.fullmatch(r"\s*(?:-+|–|nil|none|n\.?a\.?|not\s+applicable)?\s*\.?\s*", str(a), re.I):
++                        continue                                  # "-", "Nil", "": nothing to convert
++                    v = _row_rupees(a, pool, quote, text)
++                    if v is None:
++                        unclear.append(str(a))
++                        continue
++                    row["amount"] = round(float(v), 2)
++                    out["converted"] += 1
++                if unclear:
++                    out["unclear"] += len(unclear)
++                    rr = rec.setdefault("review_reasons", [])
++                    if "table_amount_unit_unclear" not in rr:
++                        rr.append("table_amount_unit_unclear")
++                    rec["table_amount_unclear"] = unclear[:10]
++            except Exception:                                     # noqa: BLE001 -- never break a filing
++                continue
++    return out
+--- a/caro/logging_setup.py
++++ b/caro/logging_setup.py
+@@ -67,6 +67,67 @@
+     return v.strip().lower() not in ("false", "0", "no", "off")
+ 
+ 
++# ---------------------------------------------------------------------------
++# Output folders (production: everything except the API log and the results is OFF)
++# ---------------------------------------------------------------------------
++# One switch per optional output. Unset = OFF. CARO_SAVE_ALL=true turns every one on (local debugging
++# reruns); CARO_WRITE_FILES=false is the old master switch and still turns every one off.
++SAVE_SWITCHES = {
++    "xml_output": "CARO_SAVE_XML_OUTPUT",          # xml_caro_output/ (clauses/, manifest)
++    "extracted_text": "CARO_SAVE_EXTRACTED_TEXT",  # logs/extracted_text/   (CARO text sent to the model)
++    "llm_replies": "CARO_SAVE_LLM_REPLIES",        # logs/extracted_llm_out/ (raw model replies)
++    "audit": "CARO_SAVE_AUDIT",                    # logs/caro_audit/        (what each rule changed and why)
++    "perf": "CARO_SAVE_PERF",                      # logs/perf/              (timing workbook)
++    "fy_tracking": "CARO_SAVE_FY_TRACKING",        # <CARO_XML_OUTPUT_DIR>/fy_tracking.csv
++    "cin_logs": "CARO_SAVE_CIN_LOGS",              # logs/cin/               (one detailed log per CIN)
++}
++
++
++def save_enabled(kind: str) -> bool:
++    """True when the optional output ``kind`` (a key of SAVE_SWITCHES) should be written to disk."""
++    master = os.environ.get("CARO_WRITE_FILES")
++    if master is not None and master.strip().lower() in ("false", "0", "no", "off"):
++        return False
++    if _env_bool("CARO_SAVE_ALL", False):
++        return True
++    return _env_bool(SAVE_SWITCHES[kind], False)
++
++
++# ---------------------------------------------------------------------------
++# Summary logging (LOG_STYLE)
++# ---------------------------------------------------------------------------
++# LOG_STYLE=summary (default): the terminal and the API log show only the short per-CIN summary
++#   (logger "caro.summary") and errors. Warnings are counted per CIN and the count is shown in the summary.
++# LOG_STYLE=detailed: every INFO / WARNING line, as before (use it when investigating a problem).
++SUMMARY_LOGGER = "caro.summary"
++_warn_local = threading.local()
++
++
++def log_style() -> str:
++    v = (os.environ.get("LOG_STYLE") or "summary").strip().lower()
++    return v if v in ("summary", "detailed") else "summary"
++
++
++class _SummaryOnly(logging.Filter):
++    def filter(self, record: logging.LogRecord) -> bool:
++        return record.name.startswith(SUMMARY_LOGGER) or record.levelno >= logging.ERROR
++
++
++class _WarningCounter(logging.Handler):
++    """Counts WARNING records of the current thread (shown as 'warnings: N' in the CIN summary)."""
++    def emit(self, record: logging.LogRecord) -> None:
++        if record.levelno == logging.WARNING and not record.name.startswith(SUMMARY_LOGGER):
++            _warn_local.count = getattr(_warn_local, "count", 0) + 1
++
++
++def warnings_reset() -> None:
++    _warn_local.count = 0
++
++
++def warnings_count() -> int:
++    return getattr(_warn_local, "count", 0)
++
++
+ def _safe_name(name: str) -> str:
+     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:80]
+ 
+@@ -110,6 +171,8 @@
+     file_handler = logging.FileHandler(log_path, encoding="utf-8")
+     file_handler.setFormatter(file_fmt)
+     file_handler.setLevel(level)
++    if log_style() == "summary":
++        file_handler.addFilter(_SummaryOnly())
+     logger.addHandler(file_handler)
+ 
+     # Console keeps the old plain-message look (no timestamp/level prefix
+@@ -117,7 +180,10 @@
+     console_handler = logging.StreamHandler(sys.stderr)
+     console_handler.setFormatter(logging.Formatter("%(message)s"))
+     console_handler.setLevel(level)
++    if log_style() == "summary":
++        console_handler.addFilter(_SummaryOnly())
+     logger.addHandler(console_handler)
++    logger.addHandler(_WarningCounter(level=logging.WARNING))
+ 
+     # Quiet down noisy third-party libraries so the log file stays readable.
+     logging.getLogger("botocore").setLevel(logging.WARNING)
+@@ -125,7 +191,7 @@
+     logging.getLogger("urllib3").setLevel(logging.WARNING)
+ 
+     _configured_path = log_path
+-    logger.info(f"logging to {log_path}")
++    logging.getLogger(SUMMARY_LOGGER).info(f"log file: {log_path}  (LOG_STYLE={log_style()})")
+     return log_path
+ 
+ 
+@@ -181,7 +247,7 @@
+         # An empty handler list means configure_logging() was never called; a
+         # NullHandler means logging was disabled. Attach nothing in both cases.
+         # CARO_WRITE_FILES=false also means no logs/cin/ file.
+-        if files_enabled() and logger.handlers and not any(
++        if save_enabled("cin_logs") and logger.handlers and not any(
+                 isinstance(h, logging.NullHandler) for h in logger.handlers):
+             out = Path(log_dir or os.environ.get("LOG_DIR", "./logs")) / "cin"
+             out.mkdir(parents=True, exist_ok=True)
+--- a/caro/audit.py
++++ b/caro/audit.py
+@@ -33,7 +33,7 @@
+ from pathlib import Path
+ from typing import Optional
+ 
+-from .logging_setup import get_logger, files_enabled
++from .logging_setup import get_logger, save_enabled
+ 
+ logger = get_logger(__name__)
+ 
+@@ -70,7 +70,11 @@
+               # PATCH 14-Oct-2026 (v7): convention rule (group, from, to, the auditor's words)
+               "v7_rule",
+               # PATCH 14-Oct-2026 (v8): decision rule (D-1, D-2, D-3, D13), and the V8_CUT passage read
+-              "v8_rule", "v8_cut_read_passage")
++              "v8_rule", "v8_cut_read_passage",
++              # PATCH 15-Oct-2026 (v9): fixes 1-4
++              "v9_rule", "v9_vii_passage", "v9_delay_not_escalated",
++              # v10: a dues-table figure whose unit could not be found (kept as printed, sent for review)
++              "table_amount_unclear")
+ 
+ _LOCK = threading.Lock()
+ 
+@@ -173,6 +177,12 @@
+         acts.append("v8_decision_rule_" + str((rec.get("v8_rule") or {}).get("rule", "")))
+     if rec.get("v8_cut_read_passage"):
+         acts.append("v8_cut_answer_read_with_clause_passage")
++    if rec.get("v9_rule"):
++        acts.append("v9_rule_" + str((rec.get("v9_rule") or {}).get("rule", "")))
++    if rec.get("v9_vii_passage"):
++        acts.append("v9_vii_read_from_clause_passage")
++    if rec.get("v9_delay_not_escalated"):
++        acts.append("v9_minor_delay_kept_qualified")
+     if rec.get("na_pushed_from_main"):
+         acts.append("not_applicable_passed_down_from_main_clause")
+     if rec.get("derived_from_document"):
+@@ -273,7 +283,7 @@
+             _REGISTRY.move_to_end(key)
+             while len(_REGISTRY) > _REGISTRY_MAX:
+                 _REGISTRY.popitem(last=False)
+-    if files_enabled():
++    if save_enabled("audit"):
+         try:
+             d = _audit_dir() / _safe(key or "no_cin")
+             d.mkdir(parents=True, exist_ok=True)
+@@ -314,7 +324,7 @@
+         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+         "filings": sorted(filings, key=lambda f: str(f.get("financial_year")), reverse=True),
+     }
+-    if files_enabled():
++    if save_enabled("audit"):
+         try:
+             d = _audit_dir()
+             d.mkdir(parents=True, exist_ok=True)
+--- a/caro/perf.py
++++ b/caro/perf.py
+@@ -397,6 +397,13 @@
+     """Finish the run, write its Excel report and forget its events. Returns the file path."""
+     if not enabled():
+         return None
++    from .logging_setup import save_enabled
++    if not save_enabled("perf"):                 # CARO_SAVE_PERF (off in production): forget the run, write nothing
++        with _LOCK:
++            rid = run_id or _RUN_ID.get()
++            if rid:
++                _RUNS.pop(rid, None)
++        return None
+     rid = run_id or _RUN_ID.get()
+     if not rid or rid not in _RUNS:
+         return None
+--- a/caro/pipeline.py
++++ b/caro/pipeline.py
+@@ -41,7 +41,7 @@
+ from .llm import LLMClient, parse_thinking_json, parse_reply
+ from .quality import score_unit, REVIEW_CONFIDENCE_THRESHOLD
+ from .registry import CLASSIFICATION_LABELS, CLASSIFICATION_LABELS_V2, CLAUSE_REGISTRY
+-from .logging_setup import get_logger, files_enabled
++from .logging_setup import get_logger, save_enabled
+ from .post_rules import (real_text, NO_TEXT, validate_evidence, apply_adverse_triggers,
+                          apply_scope_limitation, SCOPE_LIMITATION_RE, points_to_attachment,
+                          source_cannot_contain, apply_mca_box_guard, apply_subject_guard,
+@@ -524,6 +524,14 @@
+ )
+ 
+ 
++def _v9_on(fix: str) -> bool:
++    try:
++        from .staged_llm import PATCH_SWITCHES
++        return bool(PATCH_SWITCHES.get(fix, False))
++    except Exception:                                   # noqa: BLE001
++        return False
++
++
+ def _check_scope_limitation(rec: dict) -> bool:
+     """Cross-check, not a classifier: if a record the MODEL already
+     classified "qualified" has explanation/evidence text matching the
+@@ -554,6 +562,13 @@
+         if str((rec.get("staged_trace") or {}).get("scope_limited_by_meaning", "")).startswith("rejected"):
+             return False
+         text = f"{rec.get('explanation_text', '')} {rec.get('evidence_text', '')}"
++        # PATCH 15-Oct-2026 (v9, V9_SCOPE_LOANS). WHY: "The Company has not provided loans to others" (Apollo 2021-22
++        # (iii), once Fix 3d let the main clause roll up to Qualified) matched "has not provided" and showed the
++        # clause as Auditor Unable to Verify. A company not GIVING loans / guarantees / security is not the auditor
++        # being refused information.
++        if _v9_on("V9_SCOPE_LOANS"):
++            text = re.sub(r"(?i)\b(?:has|have)\s+not\s+provided\s+(?:any\s+)?(?:loans?|advances?|guarantees?|security|"
++                          r"investments?|corporate\s+guarantee)", " ", text)
+         if not (_SCOPE_LIMITATION_PATTERN.search(text) or SCOPE_LIMITATION_RE.search(text)):
+             return False
+         rec["scope_limited"] = True
+@@ -1200,6 +1215,14 @@
+             logger.info("[v8] %d label(s) set by decision rules: %s", len(_v8), _v8)
+     except Exception as e:                                        # never break extraction
+         logger.warning("[v8] skipped (%s)", e)
++    # PATCH 15-Oct-2026 (v9): fixes 3a, 3c, 4a, 4b (post_rules.apply_v9_rules)
++    try:
++        from .post_rules import apply_v9_rules
++        _v9 = apply_v9_rules(records, getattr(doc, "caro_order_year", None), getattr(doc, "p1_llm_text", None))
++        if _v9:
++            logger.info("[v9] %d label(s) set by v9 rules: %s", len(_v9), _v9)
++    except Exception as e:                                        # never break extraction
++        logger.warning("[v9] skipped (%s)", e)
+     for r in records:
+         _rollup(r)
+     _oy = getattr(doc, "caro_order_year", None)
+@@ -1726,7 +1749,7 @@
+     """Write the LLM reply EXACTLY as received (no parsing/cleanup) to
+     logs/extracted_llm_out/<stem>.txt -- same stem as logs/extracted_text/.
+     Attempt 1 -> <stem>.txt ; retries -> <stem>__attempt2.txt, ..."""
+-    if not raw_dump_stem or not files_enabled():
++    if not raw_dump_stem or not save_enabled("llm_replies"):
+         return
+     try:
+         from pathlib import Path
+@@ -1937,8 +1960,14 @@
+                 from .amounts import apply_amounts
+                 with perf.step("F5e"):                                   # perf: amounts
+                     amt = apply_amounts(extracted, caro_text, order_year)
++                    # v10 (Toby 15-Oct): disputed_dues_table[].amount in absolute rupees, like amount_total
++                    from .amounts import absolute_table_amounts
++                    _tab = absolute_table_amounts(extracted, caro_text)
+                 if amt:
+                     logger.info("[amounts] %d amount(s) set by code: %s", len(amt), amt[:12])
++                if _tab.get("converted") or _tab.get("unclear"):
++                    logger.info("[amounts] dues-table rows in rupees: %d, unit unclear (kept as printed, review): %d",
++                                _tab.get("converted"), _tab.get("unclear"))
+                 logger.info("[post_rules] evidence: %d not in input, %d partial, %d verdicts "
+                             "downgraded | %d adverse escalation(s): %s",
+                             ev_stats["absent"], ev_stats["partial"], ev_stats["downgraded"],
+@@ -2358,8 +2387,6 @@
+     _early = _before_fy_floor(doc)
+     if _early is not None:
+         return _early
+-    print("############################################")
+-    print(doc.caro_annexure_text)
+     # Isolate complete CARO annexure text extracted from ePDF.
+     # PRIMARY: caro_section_text (caro_section.py — signature-bounded, cleaned).
+     # FALLBACK: caro_annexure_text (caro_text.py — topic-density region), used
+@@ -2578,7 +2605,7 @@
+     caro_text = _prepare_llm_input(doc, caro_text, side=_mb_res if _src_short == "xml_mode_b" else None)
+     doc.p1_llm_text = caro_text                     # PATCH 7-Oct (Phase 1, F05): fingerprint for the CIN-level checks
+     perf.note_filing(source=_src_short, chars=len(caro_text or ""))
+-    if files_enabled():  # CARO_WRITE_FILES=false -> no logs/extracted_text dump
++    if save_enabled("extracted_text"):  # CARO_SAVE_EXTRACTED_TEXT -> logs/extracted_text/
+         try:
+             dump_dir = Path("logs/extracted_text")
+             dump_dir.mkdir(parents=True, exist_ok=True)
+@@ -2611,8 +2638,6 @@
+                  else f"two-call flow ({_lf()}) - Call 1 extract and map, Call 2 check and classify")
+         logger.info(f"[extract] {doc.company_name} | source={doc.source_of_clauses} | "
+                     f"{_what} over full CARO text (len={len(caro_text)})")
+-    print("*******************************************")
+-    print(getattr(doc, "caro_order_year", None))
+     _raw_fy = re.sub(r"[^\w.\-]+", "_", str(_fy_lbl)).strip("_") or "unknown_fy"
+     _raw_stem = f"{_dump_prefix(doc)}{_raw_fy}__{Path(_source_name).stem}"
+     _perf_f5 = perf.start("F5")                                   # perf: LLM extraction (all of it)
+@@ -2748,7 +2773,7 @@
+         caro_text = _prepare_llm_input(doc, caro_text, side=xml_res if source_kind == "xml_mode_b" else None)
+         doc.p1_llm_text = caro_text                 # PATCH 7-Oct (Phase 1, F05)
+     perf.note_filing(source=source_kind, chars=len(caro_text or ""), fy=_fy_label(fy_str))
+-    if files_enabled():  # CARO_WRITE_FILES=false -> no logs/extracted_text dump
++    if save_enabled("extracted_text"):  # CARO_SAVE_EXTRACTED_TEXT -> logs/extracted_text/
+         try:
+             dump_dir = Path("logs/extracted_text")
+             dump_dir.mkdir(parents=True, exist_ok=True)
+--- a/caro/xml_caro_router.py
++++ b/caro/xml_caro_router.py
+@@ -106,7 +106,7 @@
+ from pathlib import Path
+ from typing import Optional
+ 
+-from .logging_setup import get_logger, files_enabled
++from .logging_setup import get_logger, save_enabled
+ 
+ # Explicit logger name: keeps this module inside the "caro" logger tree (and therefore inside the log
+ # file / console set up by logging_setup) even when run as `python -m caro.xml_caro_router`, where
+@@ -315,7 +315,7 @@
+     Called when a CIN finishes so a long-running API process does not
+     accumulate extracted XML for every CIN it has ever served.
+     """
+-    if files_enabled() or _SCRATCH_ROOT is None:
++    if save_enabled("xml_output") or _SCRATCH_ROOT is None:
+         return
+     import shutil
+     shutil.rmtree(_SCRATCH_ROOT / _cin_dir_name(cin), ignore_errors=True)
+@@ -356,7 +356,7 @@
+     read-only mount, bad path) a WARNING is logged and ``<system temp>/xml_caro_output`` is used
+     instead, so the XML step and its tracking keep working rather than silently disappearing.
+     """
+-    if not explicit and not always and not files_enabled():
++    if not explicit and not always and not save_enabled("xml_output"):
+         return _scratch_root()
+     want = str(Path(explicit or os.environ.get("CARO_XML_OUTPUT_DIR") or "./xml_caro_output").expanduser())
+     if want in _ROOT_CHECKED:
+@@ -790,7 +790,7 @@
+     Failure to write is logged as a WARNING and otherwise ignored (an audit file must never stop an
+     extraction).
+     """
+-    if not files_enabled():                  # CARO_WRITE_FILES=false -> no audit file
++    if not save_enabled("xml_output"):      # CARO_SAVE_XML_OUTPUT -> xml_caro_manifest.jsonl
+         return
+     try:
+         root.mkdir(parents=True, exist_ok=True)
+@@ -1672,12 +1672,12 @@
+             It carries no XBRL instance, so it is only mapped, never extracted; blank for XBRL years
+             (whose AOC-4 goes in ``aoc4_xbrl_form``).
+     """
+-    if not files_enabled():                  # CARO_WRITE_FILES=false -> no fy_tracking.csv
++    if not save_enabled("fy_tracking"):     # CARO_SAVE_FY_TRACKING -> fy_tracking.csv
+         return None
+     try:
+         filing = Path(filing_path) if filing_path else Path("")
+         xr, mb = xml_result or {}, mode_b_result or {}
+-        root = _output_root(output_root)
++        root = _output_root(output_root, always=True)   # the real folder even when xml_caro_output/ is off
+         root.mkdir(parents=True, exist_ok=True)
+         path = root / "fy_tracking.csv"
+         _rotate_tracking_if_old(path)
+--- a/caro/s3_fetch.py
++++ b/caro/s3_fetch.py
+@@ -45,8 +45,8 @@
+ from pathlib import Path
+ from typing import Optional
+ 
+-import boto3
+-from botocore.exceptions import ClientError
++# boto3 / botocore are imported only when the S3 source is used (CIN_SOURCE=s3), so a server that reads
++# filings from a local folder needs neither the package nor AWS settings.
+ 
+ 
+ # "Annual Returns and Balance Sheet[...]" — prefix match (not anchored at
+@@ -100,6 +100,7 @@
+     if settings.access_key and settings.secret_key:
+         kw["aws_access_key_id"] = settings.access_key
+         kw["aws_secret_access_key"] = settings.secret_key
++    import boto3
+     return boto3.client("s3", **kw)
+ 
+ 
+@@ -107,6 +108,7 @@
+     """Locate the S3 key for a CIN's archive — zip or rar. Tries the
+     obvious exact keys first, then falls back to a prefix search so this
+     keeps working even if the bucket nests CINs under a sub-prefix."""
++    from botocore.exceptions import ClientError
+     cin = cin.strip().upper()
+ 
+     for ext in _ARCHIVE_EXTS:
+--- a/caro/sources.py
++++ b/caro/sources.py
+@@ -67,7 +67,13 @@
+         raise SourceNotConfiguredError(
+             f"CIN_SOURCE={src!r} is not recognised. Use 'local' or 's3'.")
+     # Not stated: infer from what has actually been configured.
+-    return "local" if os.environ.get("CIN_FOLDER_PATH") else "s3"
++    if os.environ.get("CIN_FOLDER_PATH"):
++        return "local"
++    # Production reads filings from a server folder. S3 is used only when asked for explicitly
++    # (CIN_SOURCE=s3); nothing configured is an error, never a silent download attempt.
++    raise SourceNotConfiguredError(
++        "No filing source configured. Set CIN_SOURCE=local and CIN_FOLDER_PATH=<folder holding the CIN folders> "
++        "(or CIN_SOURCE=s3 for the S3 bucket).")
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -94,10 +100,9 @@
+         if p.is_dir() and p.name.upper() == cin_u and p not in hits:
+             hits.append(p)
+     if not hits:
+-        for p in root.rglob("*"):
+-            if p.is_dir() and p.name.upper() == cin_u:
+-                hits.append(p)
+-                break
++        p = _find_dir_named(root, cin_u, depth=CIN_SEARCH_DEPTH)
++        if p is not None:
++            hits.append(p)
+ 
+     # The caller may have pointed CIN_FOLDER_PATH straight at one CIN.
+     if not hits and root.is_dir() and root.name.upper() == cin_u:
+@@ -113,13 +118,42 @@
+         for cand in (root / f"{cin}{suffix}", root / cin / f"{cin}{suffix}"):
+             if cand.is_file():
+                 return cand
+-    for p in root.rglob("*"):
++    for p in _walk(root, CIN_SEARCH_DEPTH):
+         if p.is_file() and p.suffix.lower() in _ARCHIVE_SUFFIXES \
+                 and p.stem.upper() == cin_u:
+             return p
+     return None
+ 
+ 
++# How deep below CIN_FOLDER_PATH a CIN folder / archive is searched for (a full recursive search of a large
++# storage tree can take minutes per CIN). Layouts seen: <root>/<CIN>, <root>/<group>/<CIN>, <root>/<a>/<b>/<CIN>.
++CIN_SEARCH_DEPTH = int(os.environ.get("CIN_SEARCH_DEPTH", "3") or 3)
++
++
++def _walk(root: Path, depth: int):
++    """Every path below root, at most `depth` levels down (breadth first, unreadable folders skipped)."""
++    level = [root]
++    for _ in range(max(depth, 0)):
++        nxt = []
++        for d in level:
++            try:
++                kids = list(d.iterdir())
++            except OSError:
++                continue
++            for k in kids:
++                yield k
++                if k.is_dir():
++                    nxt.append(k)
++        level = nxt
++
++
++def _find_dir_named(root: Path, name_upper: str, depth: int) -> Optional[Path]:
++    for p in _walk(root, depth):
++        if p.is_dir() and p.name.upper() == name_upper:
++            return p
++    return None
++
++
+ class NonXbrlDisabledSourceError(FileNotFoundError):
+     """Every filing for this CIN is Non-XBRL while Non-XBRL is disabled.
+ 
+@@ -244,33 +278,10 @@
+     """Yield [(pdf_path, filing_type), ...] for a CIN, from whichever source
+     is configured, and tear down anything temporary on the way out.
+     """
+-
+-    print("\n========== locate_filings DEBUG ==========")
+-    print(f"CIN              : {cin}")
+-    print(f"source           : {source}")
+-    print(f"folder_path      : {folder_path}")
+-    print(f"include_nonxbrl  : {include_nonxbrl}")
+-    print(f"keep_files       : {keep_files}")
+-    print(f"download_dir     : {download_dir}")
+-    print(f"extract_dir      : {extract_dir}")
+-
+-    import os
+-    print("################################################")
+-    print(folder_path)
+-    if folder_path is not None:
+-        print(f"folder_path exists: {os.path.exists(folder_path)}")
+-        print(f"folder_path is dir: {os.path.isdir(folder_path)}")
+-
+     kind = resolve_source(source)
+-
+-    print(f"Resolved source  : {kind}")
+-    print("==========================================\n")
+-
+     logger.info("[%s] resolving filings from source=%s", cin, kind)
+ 
+     if kind == "local":
+-        print(f"[{cin}] Calling _locate_local()")
+-        print(f"[{cin}] folder_path passed to _locate_local: {folder_path}")
+ 
+         with _locate_local(
+             cin,
+@@ -280,7 +291,6 @@
+             yield filings
+ 
+     else:
+-        print(f"[{cin}] Calling _locate_s3()")
+ 
+         with _locate_s3(
+             cin,
+--- a/caro/llm.py
++++ b/caro/llm.py
+@@ -18,12 +18,47 @@
+ import logging
+ import os
+ import re
++import socket
++import time
++import urllib.error
+ import urllib.request
+ from typing import Any, Optional, Protocol
+ 
+ from .logging_setup import get_logger
+ 
+ logger = get_logger(__name__)
++_summary = get_logger("caro.summary")
++
++
++def post_json(req: "urllib.request.Request", timeout: float, client: Any = None) -> dict:
++    """Send one request to the model server and return the decoded JSON reply.
++
++    A SERVER problem (cannot connect, timeout, HTTP 5xx, HTTP 429) is retried LLM_SERVER_RETRIES times (default 1)
++    after LLM_SERVER_RETRY_WAIT_S seconds (default 30). The request is byte-identical and the model runs at
++    temperature 0, so a retry cannot change a label. A problem with the ANSWER (bad JSON, cut-off reply) is not
++    handled here -- the two-call flow has its own handling for that. Every retry is shown in the summary log.
++    """
++    retries = max(0, int(os.environ.get("LLM_SERVER_RETRIES", "1") or 0))
++    wait = float(os.environ.get("LLM_SERVER_RETRY_WAIT_S", "30") or 0)
++    for attempt in range(retries + 1):
++        if client is not None:
++            client.calls = getattr(client, "calls", 0) + 1
++        try:
++            with urllib.request.urlopen(req, timeout=timeout) as r:
++                return json.loads(r.read())
++        except urllib.error.HTTPError as e:
++            if not (e.code >= 500 or e.code == 429) or attempt == retries:
++                raise
++            why = f"HTTP {e.code}"
++        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
++            if attempt == retries:
++                raise
++            why = f"{type(e).__name__}: {getattr(e, 'reason', e)}"
++        if client is not None:
++            client.server_retries = getattr(client, "server_retries", 0) + 1
++        _summary.warning("  model server error (%s) - retrying in %.0f s", why, wait)
++        time.sleep(wait)
++    raise RuntimeError("unreachable")
+ 
+ # Leave room for the chat template, guided-decoding scaffolding and tokeniser
+ # estimate error when computing how many output tokens actually fit.
+@@ -311,8 +346,7 @@
+             data=json.dumps(payload).encode(),
+             headers={"Content-Type": "application/json"},
+         )
+-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+-            data = json.loads(r.read())
++        data = post_json(req, self.timeout, self)
+         return data["message"]["content"]
+ 
+ 
+@@ -451,8 +485,7 @@
+             headers={"Content-Type": "application/json",
+                      "Authorization": f"Bearer {self.api_key}"},
+         )
+-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+-            data = json.loads(r.read())
++        data = post_json(req, self.timeout, self)
+         msg = data["choices"][0]["message"]
+         # PATCH 12-Oct-2026 (Phase 2, cut-off handling). WHY: the two-call flow must know whether a
+         # reply ended normally ("stop") or was cut off at the token limit ("length"), instead of
+--- a/caro/cin_pipeline.py
++++ b/caro/cin_pipeline.py
+@@ -397,7 +397,6 @@
+ def _process_filings_impl(cin: str, filings_found: list, client, batch_size: int,
+                           max_years: Optional[int] = None,
+                           include_nonxbrl: Optional[bool] = None) -> dict:
+-    print("Filings found:", [f[0] for f in filings_found])
+     """Run the extraction pipeline over already-located filings.
+ 
+     Takes located paths rather than fetching them, so this logic is shared
+@@ -1066,6 +1065,25 @@
+     # temp directories; for a local folder it reads in place and deletes
+     # nothing. Either way the cleanup contract is honoured on both the normal
+     # and the exception path.
++    import time as _time
++    from .logging_setup import warnings_reset
++    _t0, _calls0, _retry0 = _time.monotonic(), getattr(client, "calls", 0), getattr(client, "server_retries", 0)
++    warnings_reset()
++    _summary.info("[CIN] %s | source=%s", cin, (source or os.environ.get("CIN_SOURCE")
++                                               or ("local" if (folder_path or os.environ.get("CIN_FOLDER_PATH")) else "-")))
++    try:
++        _res = _process_cin_inner(cin, client, batch_size, keep_files, include_nonxbrl, source, folder_path,
++                                  download_dir, extract_dir, max_years)
++    except Exception as e:
++        _summary.error("  Result: FAILED - %s: %s", type(e).__name__, str(e)[:200])
++        raise
++    _log_cin_summary(cin, _res, _time.monotonic() - _t0, getattr(client, "calls", 0) - _calls0,
++                     getattr(client, "server_retries", 0) - _retry0)
++    return _res
++
++
++def _process_cin_inner(cin, client, batch_size, keep_files, include_nonxbrl, source, folder_path,
++                       download_dir, extract_dir, max_years) -> dict:
+     with perf.cin_scope(cin):                                    # perf: the CIN's total time
+         _perf_c1 = perf.start("C1")                              # perf: locate / download the bundle
+         with locate_filings(cin,
+@@ -1111,6 +1129,54 @@
+ #   * result[].Remarks             a plain sentence added to the filing's Remarks
+ #   * CARO_ews[...].review_required_flag   set to true on the units concerned
+ 
++_summary = get_logger("caro.summary")
++_LAB_SHORT = {"Adverse Remark": "ADV", "Qualified Remark": "QUAL", "Auditor Unable to Verify": "UTV",
++              "Not Reported by Auditor": "NR", "Not Available in Source": "NAS"}
++
++
++def _log_cin_summary(cin: str, res: dict, seconds: float, calls: int, retries: int) -> None:
++    """The short per-CIN block (logger caro.summary): one line per financial year, red flags, result.
++    Never raises -- a summary must not break a run."""
++    try:
++        from .logging_setup import warnings_count
++        meta = (res or {}).get("metadata") or {}
++        fmeta = {f.get("financial_year"): f for f in meta.get("filings") or []}
++        name = next((f.get("company_name") for f in fmeta.values() if f.get("company_name")), "") or ""
++        _summary.info("  company: %s | filings: %d", name[:60], len((res or {}).get("result") or []))
++        ok = failed = 0
++        reds = []
++        for r in (res or {}).get("result") or []:
++            fy = r.get("financial_year") or "?"
++            fm = fmeta.get(fy) or {}
++            status = str(fm.get("status") or ("Success" if r.get("CARO_clauses") else "-"))
++            cnt = {}
++            for c in r.get("CARO_clauses") or []:
++                k = _LAB_SHORT.get(c.get("classification"))
++                if k:
++                    cnt[k] = cnt.get(k, 0) + 1
++            review = sum(1 for e in r.get("CARO_ews") or [] for x in [e] + list(e.get("sub_clause_ews") or [])
++                         if (x.get("score_ready_fields") or {}).get("review_required_flag"))
++            if status.lower().startswith("success"):
++                ok += 1
++                order = fm.get("caro_order_year") or "-"
++                _summary.info("  FY %-8s CARO %-5s OK      ADV %d  QUAL %d  UTV %d  NR %d  review %d", fy, order,
++                              cnt.get("ADV", 0), cnt.get("QUAL", 0), cnt.get("UTV", 0), cnt.get("NR", 0), review)
++            else:
++                failed += 1 if status.lower().startswith("fail") else 0
++                why = (fm.get("error") or (r.get("Remarks") or "") or "")[:90]
++                _summary.info("  FY %-8s %-10s %s", fy, status.upper()[:10], why)
++            if r.get("red_flag_clause_ids"):
++                reds.append(f"{fy}: " + ", ".join(f"({x})" for x in r["red_flag_clause_ids"]))
++        if reds:
++            _summary.info("  red flags: %s", " | ".join(reds)[:300])
++        m, sec = divmod(int(seconds), 60)
++        _summary.info("  Result: %s %d/%d filings | %dm %02ds | model calls %d (server retries %d) | warnings %d",
++                      "SUCCESS" if not failed else "PARTIAL", ok, ok + failed, m, sec, calls, retries,
++                      warnings_count())
++    except Exception as e:                                       # noqa: BLE001
++        _summary.info("  (summary not available: %s)", e)
++
++
+ def _fy_end(label: Optional[str]) -> Optional[int]:
+     m = re.match(r"\s*(\d{4})\s*-\s*(\d{2,4})", str(label or ""))
+     if not m:
+--- a/caro/post_rules.py
++++ b/caro/post_rules.py
+@@ -966,6 +966,11 @@
+         not in ("false", "0", "no", "off")
+     table = ADVERSE_TRIGGERS[_edition(order_year)]
+     done = []
++    # PATCH 15-Oct-2026 (v9, F1): the Adverse rules never read a printed CARO question as a finding
++    _qs = _patch_on("V9_QSTRIP")
++
++    def _rh(rule, t, staged):
++        return rule.hit(strip_printed_questions(t) if (_qs and staged) else t)
+     for r in records or []:
+         if not isinstance(r, dict):
+             continue
+@@ -981,7 +986,12 @@
+             # (the model quoted the finding yet did not grade it)
+             quoted_gap = (wide and cls == "insufficient_evidence"
+                           and rec.get("evidence_check") == "valid" and real_text(rec.get("evidence_text")))
+-            if cls not in _ESCALATABLE and not quoted_gap:
++            # PATCH 15-Oct-2026 (v9, F2): (vii)(a) / (vii)(b) are also read from the whole (vii) passage, even
++            # when the model placed no text on them (Mbook 2024-25 (vii)(b): the dispute table was placed nowhere)
++            f2_unit = (level == "sub" and bool(rec.get("_staged")) and bool(caro_text) and _patch_on("V9_VII_PASSAGE")
++                       and not rec.get("scope_limited")
++                       and _unit_id(rec, level, main_id).lower() in ("vii_a", "vii_b"))
++            if cls not in _ESCALATABLE and not quoted_gap and not (f2_unit and cls == "insufficient_evidence"):
+                 continue
+             uid = _unit_id(rec, level, main_id)
+             rules = [x for x in (table.get(uid) or []) if (wide or not getattr(x, "pkg13", False))
+@@ -993,20 +1003,21 @@
+             nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+             text = "\n".join(strip_labels(t) for t in (real_text(rec.get("evidence_text")),
+                                                       real_text(nf.get("source_text"))) if t)
+-            if not text:
++            if not text and not f2_unit:
+                 continue
++            _st = bool(rec.get("_staged"))
+             hit = None
+-            for rule in rules:
+-                sent = rule.hit(text)
++            for rule in (rules if text else []):
++                sent = _rh(rule, text, _st)
+                 if sent:
+                     hit = (rule, sent, False)
+                     break
+-            if hit is None and wide:
++            if hit is None and wide and text:
+                 win = clause_window(rec.get("evidence_text"), caro_text)
+                 if win:
+                     win = strip_labels(win)
+                     for rule in rules:
+-                        sent = rule.hit(win)
++                        sent = _rh(rule, win, _st)
+                         if sent:
+                             hit = (rule, sent, True)
+                             break
+@@ -1014,10 +1025,10 @@
+             # the auditor's "there are no dues ... on account of any dispute" is printed twice (MCA box, then the
+             # narrative with the CESTAT / GST demand table); the window read only the first copy. Replay over every
+             # unit: exactly this one unit changes.
+-            if hit is None and wide and rec.get("_staged") and _patch_on("F19"):
++            if hit is None and wide and text and rec.get("_staged") and _patch_on("F19"):
+                 for win in clause_windows_all(rec.get("evidence_text"), caro_text)[1:]:
+                     for rule in rules:
+-                        sent = rule.hit(win)
++                        sent = _rh(rule, win, _st)
+                         if sent:
+                             hit = (rule, sent, True)
+                             break
+@@ -1029,7 +1040,7 @@
+                 mnf = r.get("normalized_fields") if isinstance(r.get("normalized_fields"), dict) else {}
+                 mtxt = strip_labels(real_text(mnf.get("source_text")) or "")
+                 if mtxt:
+-                    sent = R_ARREARS_LISTED.hit(mtxt)
++                    sent = _rh(R_ARREARS_LISTED, mtxt, _st)
+                     if sent:
+                         hit = (R_ARREARS_LISTED, sent, True)
+             if hit is None and level == "sub" and rec.get("_staged") and _patch_on("V8_CUT") \
+@@ -1045,15 +1056,26 @@
+                         mtxt = mtxt.replace(t_, " ")
+                 if mtxt:
+                     for rule in rules + ([R_NPA_CUT] if uid in ("ix_a", "viii") else []):
+-                        sent = rule.hit(mtxt)
++                        sent = _rh(rule, mtxt, _st)
+                         if sent and not any(sent[:80] in t_ for t_ in sib if t_):
+                             hit = (rule, sent, True)
+                             rec["v8_cut_read_passage"] = True
+                             break
+             if hit is None and uid == "xvii" and rec.get("_staged") and _patch_on("F33"):          # PATCH 13-Oct-2026 (F33)
+-                sent = cash_loss_with_amount(text)
++                sent = cash_loss_with_amount(strip_printed_questions(text) if _qs else text)
+                 if sent:
+                     hit = (R_CASH_LOSS_AMT, sent, False)
++            if hit is None and f2_unit:                                 # PATCH 15-Oct-2026 (v9, F2)
++                g = vii_passage_hit(uid.lower(), r, subs, rec, caro_text)
++                if g:
++                    hit = (g[0], g[1], True)
++                    rec["v9_vii_passage"] = {"rule": g[0].rid, "words": g[1][:300]}
++            # PATCH 15-Oct-2026 (v9, Fix 4b, Toby 15-Oct): a delay in repaying a lender that was made good (no
++            # "has defaulted", no NPA, nothing unpaid) is Qualified, not Adverse -> the default rule does not escalate
++            if hit and hit[0] is R_DEFAULT and uid in ("ix_a", "viii") and _st and _patch_on("V9_DELAY_QUAL") \
++                    and minor_delay_only(hit[1], text):
++                rec["v9_delay_not_escalated"] = hit[1][:300]
++                hit = None
+             if hit:
+                 rule, sent, from_window = hit
+                 if cls == "insufficient_evidence":
+@@ -3012,6 +3034,13 @@
+             continue
+         if any(x.get("classification") in ("qualified", "adverse") or x.get("scope_limited") for x in [r] + subs):
+             continue
++        # PATCH 15-Oct-2026 (v9, Fix 3d). WHY: N2 (8-Oct) was applied only on the review branch above; on this
++        # label-changing branch a sub-point sentence ("(f) has not granted any loan ... repayable on demand") set
++        # (iii)(b)-(d) to NA (Apollo 2021-22 lost "schedule ... has not been stipulated"). Labels change only when
++        # one sentence covers the WHOLE clause (the word "any" is not required: Aditya 2022-23).
++        if _patch_on("V9_BLANKET_GATE") and any(x.get("_staged") for x in [r] + subs) and not v9_whole_clause(texts):
++            done.append((main_id, "v9_no_whole_clause_sentence"))
++            continue
+         sent = pat.search(blanket)
+         quote = blanket[max(0, sent.start() - 120):sent.end() + 160].strip()
+         changed_here = 0
+@@ -3266,8 +3295,9 @@
+     if uid == "i_c":                           # F09 non-exception: "except the following:" + an empty / NA table
+         m = re.search(r"except\s+(?:for\s+)?the\s+following\s*[:\-–]*", t, re.I)
+         if m:
+-            rest = re.sub(r"(?i)description\s+of\s+property|gross\s+carrying\s+value|held\s+in\s+(?:the\s+)?name\s+of|whether\s+promoter[^A-Z]*?employee|"
+-                          r"period\s+held[^A-Z]*?appropriate|reason\s+for\s+not\s+being\s+held\s+in\s+(?:the\s+)?name\s+of\s+(?:the\s+)?company|\*|"
++            _any = r"[^\n]{0,80}?" if _patch_on("V9_G2_HEADER") else r"[^A-Z]*?"   # PATCH 15-Oct-2026 (v9, Fix 3b)
++            rest = re.sub(r"(?i)description\s+of\s+property|gross\s+carrying\s+value|held\s+in\s+(?:the\s+)?name\s+of|whether\s+promoter" + _any + r"employee|"
++                          r"period\s+held" + _any + r"appropriate|reason\s+for\s+not\s+being\s+held\s+in\s+(?:the\s+)?name\s+of\s+(?:the\s+)?company|\*|"
+                           r"indicate\s+range,?\s+where\s+appropriate|director\s+or\s+their\s+relative\s+or\s+employee|[,\-–:;/()]", "", t[m.end():])
+             if re.fullmatch(r"\s*(?:(?:n\.?\s?a\.?|nil|none|not\s+applicable)\s*)+\.?\s*", rest, re.I):
+                 return t[:240]
+@@ -3640,6 +3670,236 @@
+                 out.append((uid, rid, lab, new))
+             except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
+                 continue
++    return out
++
++
++# ===========================================================================
++# PATCH 15-Oct-2026 (v9). Fixes 1-4 approved by Toby on 15 Oct 2026 (audit of the 14/15-Oct run, 42 CINs).
++# Code only, after the model, two-call records only. Each has its own switch in staged_llm.PATCH_SWITCHES;
++# all off = v8 output. Never changes an Adverse or an Auditor Unable to Verify (except F1/F2/4b, which act
++# inside the Adverse triggers). Every change is in the audit file (v9_rule / v9_vii_passage / v9_delay_not_escalated).
++#   F1  V9_QSTRIP       the printed CARO question ("Whether the company has incurred cash losses ...") is not read
++#                       by the Adverse triggers (Eleanor 2023-24 / 2024-25: 6 false Adverse labels)
++#   F2  V9_VII_PASSAGE  (vii)(a) arrears / (vii)(b) disputed dues read from the whole (vii) passage, bounded at
++#                       (viii), lines rejoined, sibling text removed (Committed 2022-23, Starlite 2020-21, Mbook 2024-25)
++#   3a  V9_IC_NOPROP    (i)(c) "does not hold any immovable property" -> Not Applicable
++#   3b  V9_G2_HEADER    v7 G2 empty exception table: header words were not removed (regex bug), "NA" bodies missed
++#   3c  V9_D3_DISCLOSED (iii)(a) loans given, details "disclosed in the financial statements", no figure -> Qualified (D-3)
++#   3d  V9_BLANKET_GATE blanket NA only from a sentence that covers the whole clause (N2 test on the label branch)
++#   4a  V9_D1C          (vii)(a) "generally regular", no delay, and the arrears question unanswered anywhere in (vii)
++#                       -> Qualified (Toby 15-Oct)
++#   4b  V9_DELAY_QUAL   (ix)(a) a delay made good ("not defaulted ... except some delay", "paid on ...") -> Qualified;
++#                       "has defaulted" / NPA / unpaid stays Adverse (Toby 15-Oct)
++# ===========================================================================
++_V9_Q = re.compile(r"(?:^|(?<=[.;:\n]))\s*(?:\(?[ivx]+\)?\s*)?(?:\(?[a-z]\)\s*)?(?:\([a-z]\)\s*)?"
++                   r"(?:(?!\b(?:we|our|us)\b)[^.;\n]){0,80}?\bwhether\b[^;?\n]*(?:[;?]|$)", re.I)
++
++
++def strip_printed_questions(t: str) -> str:
++    """The text without the printed CARO question(s) (question-and-answer table layouts)."""
++    return _V9_Q.sub(" ", t or "")
++
++
++_V9_VII_END = re.compile(r"\n\s*(?:\(?viii\)?[.)]|8\.)|unrecorded\s+income|previously\s+unrecorded|surrendered\s+or\s+disclosed|"
++                         r"\[MCA_BOX:(?![^\]]*(?:statutory\s+dues|regularity))", re.I)
++_V9_DISPUTE_CTX = re.compile(r"on\s+account\s+of\s+(?:any\s+)?disput|dispute\s+is\s+pending|under\s+dispute", re.I)
++
++
++def _v9_norm(t: str) -> str:
++    return re.sub(r"\s+", " ", t or "").strip()
++
++
++_V9_VII_START = re.compile(r"(?:^|\n)[ \t]*(?:\(\s*vii\s*\)|vii\s*[.)]|7\s*[.)])|\[MCA_BOX:[^\]]*(?:statutory\s+dues|regularity)|"
++                           r"in\s+respect\s+of\s+statutory\s+dues", re.I)
++
++
++_V9_VII_ANCHOR = re.compile(r"undisputed\s+(?:statutory\s+)?dues|in\s+respect\s+of\s+statutory\s+dues|regular(?:ly)?\s+(?:in\s+)?deposit|"
++                            r"statutory\s+dues[^.]{0,200}(?:regular|deposited)", re.I)
++
++
++def vii_passage(main: dict, caro_text: str, subs: Optional[list] = None) -> str:
++    """The (vii) passage(s) of the annexure, found by subject (not by the model's quotes, whose generic opening
++    words can match another clause): every place the statutory-dues answer starts, from the clause's number /
++    MCA box / sentence start to the start of (viii), wrapped lines joined. Several copies (MCA box + narrative)
++    are all kept."""
++    t = caro_text or ""
++    segs, last_end = [], -1
++    for m in _V9_VII_ANCHOR.finditer(t):
++        if m.start() < last_end:
++            continue
++        back = t[max(0, m.start() - 600):m.start()]
++        ms = list(_V9_VII_START.finditer(back))
++        if ms:
++            s0 = max(0, m.start() - 600) + ms[-1].start()
++        else:
++            k = max(back.rfind("\n\n"), back.rfind(". "))
++            s0 = max(0, m.start() - 600) + (k + 1 if k >= 0 else 0)
++        seg = t[s0:s0 + 4000]
++        e = _V9_VII_END.search(seg, (m.start() - s0) + 150)
++        if e:
++            seg = seg[:e.start()]
++        last_end = s0 + len(seg)
++        segs.append(seg)
++    reg = strip_labels("\n\n".join(segs))
++    reg = re.sub(r"(?<![.:;])\s*\n\s*(?=[a-z0-9,(])", " ", reg)
++    return strip_printed_questions(reg) if _patch_on("V9_QSTRIP") else reg
++
++
++def vii_passage_hit(uid: str, main: dict, subs: list, rec: dict, caro_text: str):
++    """(rule, sentence) when the (vii) passage states undisputed arrears over six months ((vii)(a)) or a disputed-dues
++    table with an amount ((vii)(b)); None otherwise."""
++    reg = vii_passage(main, caro_text, subs)
++    if not reg:
++        return None
++    other = "vii_b" if uid == "vii_a" else "vii_a"
++    sib = ""
++    for s in subs:
++        if s is not rec and _unit_id(s, "sub", "vii").lower() == other:
++            sib = _v9_norm(strip_labels(real_text((s.get("normalized_fields") or {}).get("source_text")) or ""))
++    p2 = _v9_norm(reg)
++    if len(sib) >= 20:
++        p2 = p2.replace(sib, " ")
++    if uid == "vii_a":
++        for rule in (R_ARREARS, R_ARREARS_LISTED):
++            h = rule.hit(reg)
++            if h and not re.search(r"(?<!un)disput", h, re.I) and _v9_norm(h)[:40] in p2:
++                return rule, h
++        return None
++    h = R_DISPUTED.hit(reg)
++    if h:
++        k = reg.find(h[:60])
++        if _V9_DISPUTE_CTX.search(reg[max(0, k - 800):k + 200]) and not re.search(r"default|intimation", h, re.I):
++            return R_DISPUTED, h
++    return None
++
++
++_V9_HARD_DEFAULT = re.compile(r"\bhas\s+defaulted|\bhave\s+defaulted|\bNPA\b|non[-\s]?performing|\bnot\s+(?:been\s+)?paid|\bunpaid|"
++                              r"\birr+egular|not\s+(?:been\s+)?regular|outstanding\s+as\s+(?:at|on)|still\s+outstanding|"
++                              r"wil+ful\s+defaulter\s+(?!.{0,20}\bnot)", re.I)
++_V9_DELAY = re.compile(r"\bdelay", re.I)
++
++
++def minor_delay_only(sentence: str, text: str) -> bool:
++    """Toby 15-Oct (4b): the auditor reports only a delay that was made good."""
++    return bool(_V9_DELAY.search(sentence or "")) and not _V9_HARD_DEFAULT.search(text or "") \
++        and not _V9_HARD_DEFAULT.search(sentence or "")
++
++
++_V9_NOPROP = re.compile(r"(?:does|do|did)\s*(?:not|n['’]t)\s+(?:have|hold|own|possess)\s+any\s+immovable\s+propert|"
++                        r"not\s+(?:having|holding|owning)\s+any\s+immovable\s+propert|\bno\s+immovable\s+propert|"
++                        r"(?:does|do)\s*(?:not|n['’]t)\s+hold\s+any\s+(?:freehold\s+)?(?:land|title\s+deeds)", re.I)
++_V9_DISCLOSED = re.compile(r"disclosed\s+in\s+(?:the\s+)?(?:standalone\s+)?(?:financial\s+statements?|notes?\s+to)|refer\s+note", re.I)
++_V9_LOAN_GIVEN = re.compile(r"aggregate\s+amount\s+of\s+(?:the\s+)?(?:loans?|advances?|guarantees?)|"
++                            r"(?:has|have)\s+(?:also\s+)?(?:granted|provided|given|made|advanced|stood)", re.I)
++_V9_D1C_BAD = re.compile(r"\bexcept\b|\bhowever\b|\bbut\b|\bdelay|\bnot\s+(?:been\s+)?(?:regular|deposited|paid)|\birregular|"
++                         r"\bdefault|\bvariation", re.I)
++_V9_HEDGE = re.compile(r"\bgenerally\s+(?:been\s+)?(?:deposited\s+)?regular", re.I)
++_V9_ARREARS_ANSWERED = re.compile(
++    r"\bno\b[^.]{0,80}?\b(?:amounts?|dues|arrears|sums?)\b[^.]{0,300}?(?:six|6)\s+months|"
++    r"\b(?:not|nor)\s+(?:have|had|has)\s+any\b[^.]{0,80}?\b(?:amounts?|dues|arrears)\b[^.]{0,250}?(?:six|6)\s+months|"
++    r"\bno\s+arrears\b|not\s+(?:been\s+)?outstanding[^.]{0,120}(?:six|6)\s+months|"
++    r"\b(?:there\s+)?(?:is|are|were|was)\s+no\s+(?:statutory\s+)?dues\b|\bno\s+dues\s+(?:as\s+on|outstanding)", re.I)
++
++
++def _v9_arrears_answered(passage: str) -> bool:
++    passage = re.sub(r"\s+", " ", passage or "")
++    for s in _sentences(passage):
++        if _V9_ARREARS_ANSWERED.search(s) and not re.search(r"(?<!un)disput", s, re.I):
++            return True
++    # a stray full stop inside the auditor's sentence ("Goods and Service Tax. Customs Duty ... six months"): read a
++    # short window across it. Lenient on purpose -- reading "answered" here can only keep today's label.
++    for m in re.finditer(r"\bno\s+(?:undisputed\s+)?(?:amounts?|dues|arrears)\b", passage, re.I):
++        w = passage[m.start():m.start() + 450]
++        k = re.search(r"(?:six|6)\s+months", w, re.I)
++        if k and not re.search(r"(?<!un)disput", w[:k.end()], re.I):
++            return True
++    return any(rule.hit(passage) for rule in (R_ARREARS, R_ARREARS_LISTED))
++
++
++def v9_whole_clause(texts: list) -> Optional[str]:
++    """N2 whole-clause test (8-Oct) without requiring the word "any": one sentence that says nothing was made /
++    provided / granted / given, names the whole clause, and has no carve-out and no sub-point letter (b)-(h)."""
++    neg = re.compile(r"\bnot\s+(?:made|provided|granted|given|stood)\b", re.I)
++    for t in texts:
++        for s in _p1_sentences(t):
++            if not neg.search(s) or _BLANKET_PARTIAL.search(s) or _SUBPOINT_START.match(s):
++                continue
++            w = s.lower()
++            if _BLANKET_PARTIES.search(s) or all(k in w for k in ("investment", "guarantee", "security", "loan")):
++                return s
++    return None
++
++
++_V9_WHY = {"IC": "the company holds no immovable property, so (i)(c) does not arise (Fix 3a)",
++           "D3B": "loans are stated as given but the amounts are only 'disclosed in the financial statements' (D-3, Fix 3c)",
++           "D1C": "'generally regular' and the arrears question is not answered anywhere in clause (vii) (Toby 15-Oct, Fix 4a)",
++           "DQ": "a delay in repaying a lender that was made good; no default, NPA or unpaid amount (Toby 15-Oct, Fix 4b)"}
++
++
++def apply_v9_rules(records: list, order_year, caro_text: Optional[str] = None) -> list:
++    """PATCH 15-Oct-2026 (v9). Called from pipeline.assemble_document after apply_v8_rules, before the roll-up.
++    Returns [(unit, rule, from, to)]. Never raises."""
++    out = []
++    try:
++        ed = 2016 if _edition(order_year) == 2016 else 2020
++    except Exception:                                          # noqa: BLE001
++        return out
++    for r in records or []:
++        if not isinstance(r, dict):
++            continue
++        main_id = str(r.get("main_clause_id", "")).strip().lower().strip("()")
++        subs = [s for s in (r.get("sub_clauses") or []) if isinstance(s, dict)]
++        for rec, level in ([(s, "sub") for s in subs] or [(r, "main")]):
++            try:
++                if not rec.get("_staged") or any(rec.get(k) for k in _V8_KEEP_KEYS) or rec.get("v8_rule"):
++                    continue
++                cls = rec.get("classification")
++                if cls == "qualified" and rec.get("scope_limited"):
++                    continue
++                lab = _V7_LABEL.get(cls)
++                if lab in (None, "ADV"):
++                    continue
++                uid = _unit_id(rec, level, main_id).lower()
++                nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++                own = strip_labels(real_text(nf.get("source_text")) or "")
++                if own.lower().startswith("(from main clause)"):
++                    own = ""
++                own_a = strip_printed_questions(own)
++                g, rid = None, None
++                if ed == 2020 and uid == "i_c" and lab == "FAV" and _patch_on("V9_IC_NOPROP"):
++                    m = _V9_NOPROP.search(own_a)
++                    if m and not re.search(r"\bexcept\b|\bhowever\b|\bbut\b", own_a, re.I):
++                        g, rid = ("NA", own_a.strip()[:300]), "IC"
++                if g is None and ed == 2020 and uid in ("iii_a_a", "iii_a_b") and lab == "FAV" and _patch_on("V9_D3_DISCLOSED"):
++                    if _V9_DISCLOSED.search(own_a) and _V9_LOAN_GIVEN.search(own_a) and not _V8_AMOUNT.search(own_a) \
++                            and not re.search(r"\b(?:has|have)\s+not\b|\bno\s+(?:loans?|advances?)\b|\bnil\b", own_a, re.I):
++                        g, rid = ("QUAL", own_a.strip()[:300]), "D3B"
++                if g is None and uid == "vii_a" and lab == "FAV" and own and _patch_on("V9_D1C") and caro_text:
++                    if _V9_HEDGE.search(own_a) and not _V8_DELAY.search(own_a) and not _V9_D1C_BAD.search(own_a):
++                        passage = vii_passage(r, caro_text, subs) or own_a
++                        if not _v9_arrears_answered(passage):
++                            g, rid = ("QUAL", _V9_HEDGE.search(own_a).group(0) + " — " + own_a.strip()[:260]), "D1C"
++                if g is None and uid in (("ix_a",) if ed == 2020 else ("viii",)) and lab == "FAV" and own \
++                        and _patch_on("V9_DELAY_QUAL"):
++                    if re.search(r"\bexcept\b[^.]{0,160}\bdelay|\bdelay[^.]{0,120}\b(?:paid|repaid|regulari[sz]ed)", own_a, re.I) \
++                            and not _V9_HARD_DEFAULT.search(own_a):
++                        g, rid = ("QUAL", own_a.strip()[:300]), "DQ"
++                if not g or g[0] == lab:
++                    continue
++                new, words = g
++                info = {"rule": rid, "from_label": lab, "to_label": new, "words": (words or "")[:300], "why": _V9_WHY[rid]}
++                lead = {"FAV": "Favourable", "NA": "Not applicable", "QUAL": "Qualified"}[new]
++                if rid == "D1C":
++                    expl = (lead + " — the auditor says statutory dues were generally regularly deposited but does not "
++                            "state whether any undisputed dues were in arrears for more than six months: \"" + own_a.strip()[:260] + "\"")
++                else:
++                    expl = lead + " — the auditor reports: \"" + (words or "")[:300] + "\""
++                _p1_set_label(rec, _V7_CLS[new], "v9_rule", info, expl, None)
++                if new == "QUAL":
++                    _add_reason(rec, "v9_rule_" + rid)
++                out.append((uid, rid, lab, new))
++            except Exception:                                  # noqa: BLE001 -- a rule must never break a filing
++                continue
+     return out
+ 
+ 
+--- a/caro/staged_llm.py
++++ b/caro/staged_llm.py
+@@ -51,8 +51,17 @@
+ def llm_flow() -> str:
+     """CARO_LLM_FLOW: single (default, today's one call) | staged (Option A, falls back to the
+     single call per filing) | staged_nofallback (TEST MODE: never the single call -- soft check
+-    failures are only recorded as "would_fall_back" in the audit file)."""
+-    v = (os.environ.get("CARO_LLM_FLOW") or "single").strip().lower()
++    failures are only recorded as "would_fall_back" in the audit file).
++
++    PATCH 15-Oct-2026 (v9, Toby): production runs the two-call flow ONLY. With PATCH_SWITCHES["V9_TWO_CALL_ONLY"]
++    (default True) an unset CARO_LLM_FLOW, "staged" or anything unknown means the two-call flow with no fallback
++    to the single call: a check that used to send the filing to the single call is recorded (audit:
++    would_fall_back) and the units are flagged for review; a filing whose two calls fail is reported as failed.
++    The single-call prompt and code stay in the repository; CARO_LLM_FLOW=single is the emergency rollback."""
++    raw = (os.environ.get("CARO_LLM_FLOW") or "").strip().lower()
++    if PATCH_SWITCHES.get("V9_TWO_CALL_ONLY", False):
++        return "single" if raw == "single" else "staged_nofallback"
++    v = raw or "single"
+     return v if v in FLOWS else "single"
+ 
+ 
+@@ -138,6 +147,17 @@
+     "V8_D3": True,   # incomplete answer on the point's own subject -> Qualified (D-3)
+     "V8_D13": True,  # (v) deposits accepted, provisions "applicable", no compliance stated -> Qualified (D13)
+     "V8_CUT": True,  # a sub-point whose copied text stops at ":" -> Adverse triggers also read the clause passage
++    # PATCH 15-Oct-2026 (v9): fixes 1-4 approved by Toby on 15 Oct (code only, after the model)
++    "V9_TWO_CALL_ONLY": True,  # two-call flow only, never the single-call fallback (CARO_LLM_FLOW=single = emergency rollback)
++    "V9_QSTRIP": True,         # Fix 1: Adverse triggers never read the printed CARO question
++    "V9_VII_PASSAGE": True,    # Fix 2: (vii)(a) arrears / (vii)(b) disputed dues read from the whole (vii) passage
++    "V9_IC_NOPROP": True,      # Fix 3a: (i)(c) no immovable property -> Not Applicable
++    "V9_G2_HEADER": True,      # Fix 3b: v7 G2 empty / "NA" exception table (header words regex)
++    "V9_D3_DISCLOSED": True,   # Fix 3c: (iii)(a) loans given, amounts only "disclosed in the financial statements" -> Qualified
++    "V9_BLANKET_GATE": True,   # Fix 3d: blanket NA only from a whole-clause sentence
++    "V9_D1C": True,            # Fix 4a: (vii)(a) "generally regular", arrears question unanswered in (vii) -> Qualified
++    "V9_SCOPE_LOANS": True,    # companion to 3d: "has not provided loans/guarantees" is not "auditor unable to verify"
++    "V9_DELAY_QUAL": True,     # Fix 4b: (ix)(a) delay made good -> Qualified; "has defaulted" / NPA / unpaid stays Adverse
+     "RECHECK_GUARD": True,     # the recheck reply is capped (RECHECK_MAX_TOKENS) and a network error / timeout in the recheck keeps the first answers instead of failing the filing        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+--- a/tests/run_phase2_cases.py
++++ b/tests/run_phase2_cases.py
+@@ -52,6 +52,9 @@
+ _V6_FROZEN = ("F35", "P1", "P2_NOTE", "P6", "P7C", "P7D", "P7E", "P8", "P13", "P16", "GUARD_INCOMPLETE_NOTE")
+ for _k in _V5_FROZEN + _V6_FROZEN:
+     st.PATCH_SWITCHES[_k] = True
++# PATCH 15-Oct-2026 (v9): production is two-call only (V9_TWO_CALL_ONLY, shipped True). The suite still proves the
++# single-call fallback machinery kept for rollback (F1-F6), so it runs with the switch OFF; V9-0 checks the shipped value.
++st.PATCH_SWITCHES["V9_TWO_CALL_ONLY"] = False
+ from caro import post_rules as pr, mca_table as MT, audit, perf, result_cache          # noqa: E402
+ 
+ RESULTS = []
+@@ -254,6 +257,432 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# V9 (15-Oct-2026): fixes 1-4. Real filing wording; every rule has a counter-case that must NOT change.
++# Runs on its own with:  python tests/run_phase2_cases.py --v9-only
++# ---------------------------------------------------------------------------
++def v9_cases():
++    import os as _os
++    from caro import post_rules as P9, pipeline as PL9, staged_llm as S9
++    sw = dict(S9.PATCH_SWITCHES)
++    for k in sw:
++        if k.startswith("V9_"):
++            S9.PATCH_SWITCHES[k] = True
++
++    check("V9-0 shipped: every V9 switch is ON (two-call only, fixes 1-4)",
++          all(_SHIPPED.get(k) is True for k in _SHIPPED if k.startswith("V9_")) and "V9_TWO_CALL_ONLY" in _SHIPPED,
++          {k: _SHIPPED.get(k) for k in _SHIPPED if k.startswith("V9_")})
++    saved_env = _os.environ.get("CARO_LLM_FLOW")
++    got = {}
++    for v in (None, "staged", "staged_nofallback", "single", "xyz"):
++        _os.environ.pop("CARO_LLM_FLOW", None)
++        if v:
++            _os.environ["CARO_LLM_FLOW"] = v
++        got[v] = S9.llm_flow()
++    if saved_env is None:
++        _os.environ.pop("CARO_LLM_FLOW", None)
++    else:
++        _os.environ["CARO_LLM_FLOW"] = saved_env
++    check("V9-1 two-call only: unset / staged / unknown -> no fallback; single only when asked (rollback)",
++          got == {None: "staged_nofallback", "staged": "staged_nofallback", "staged_nofallback": "staged_nofallback",
++                  "single": "single", "xyz": "staged_nofallback"}, got)
++
++    # ---- Fix 1: printed question (Eleanor 2023-24 table layout)
++    qa_w = ("ix (b) Whether the company is a declared wilful defaulter by any bank or financial institution or other lender; "
++            "According to the information and explanations given to us and on the basis of our examination of the records of "
++            "the Company, the Company has not been declared a willful defaulter by any bank or financial institution or "
++            "government or government authority.")
++    qa_c = ("(xvii) Cash Losses Whether the company has incurred cash losses in the financial year and in the immediately "
++            "preceding financial year, if so, state the amount of cash losses; The Company has not incurred cash losses in "
++            "the current year and preceding financial year.")
++    check("V9-2 Fix 1: the question sentence alone used to trigger (wilful defaulter, cash loss)",
++          bool(P9.R_WILFUL.hit(qa_w)) and bool(P9.R_CASH_LOSS.hit(qa_c)))
++    check("V9-3 Fix 1: with the question stripped neither triggers",
++          not P9.R_WILFUL.hit(P9.strip_printed_questions(qa_w)) and not P9.R_CASH_LOSS.hit(P9.strip_printed_questions(qa_c)))
++    rec = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_b", "classification": "clean", "_staged": True,
++           "evidence_text": qa_w, "normalized_fields": {"source_text": qa_w}}]}
++    P9.apply_adverse_triggers([rec], 2020, {"ix"})
++    check("V9-4 Fix 1 end to end: Eleanor (ix)(b) stays Favourable", rec["sub_clauses"][0]["classification"] == "clean",
++          rec["sub_clauses"][0].get("severity_escalated_by_rule"))
++    real_ans = ("(b) Whether the dues have not been deposited on account of dispute; The following dues have not been "
++                "deposited on account of dispute: Income Tax Act, Income tax demand Rs. 2,81,900, AY 2018-19, Forum where "
++                "dispute is pending: CIT (Appeals).")
++    check("V9-5 Fix 1 counter-case: a real disputed-dues answer after the question still triggers (Atharv layout)",
++          bool(P9.R_DISPUTED.hit(P9.strip_printed_questions(real_ans))))
++    we = "We have examined whether the company has incurred cash losses of Rs. 12,40,000 during the year."
++    check("V9-6 Fix 1 counter-case: an auditor's own 'we ... whether' sentence is not stripped",
++          "12,40,000" in P9.strip_printed_questions(we))
++
++    # ---- Fix 2: (vii) passage (Committed Ispat 2022-23; Starlite 2020-21 style; K.R. Foods / Rama counter-cases)
++    committed = ("vii.\n\na) According to the information and explanations given to us and the records of the company examined "
++                 "by us, in our opinion, the undisputed statutory dues including income-tax, goods and services Tax, and any "
++                 "other statutory dues, as applicable, have generally been regularly deposited with the appropriate "
++                 "authorities.\n\nb) According to the information and explanations given to us, there were following amounts "
++                 "payable in respect thereof were in arrears as at the last day of the financial year for a period of more "
++                 "than six months from the date they become payable.\n\nAccording to the information and explanations given "
++                 "to us and the records of the company examined by us, there are no statutory dues relating to GST, Provident "
++                 "Fund, Employees State Insurance, income-Tax, Duty of Customs or Cess or other statutory dues, which have not "
++                 "been deposited with the appropriate authorities on account of any dispute.\n\nS. No.\n\nYear\n\nAmount "
++                 "Outstanding as on 31.3.2023\n\n1.\n\nAY-2007-08\n\n33,83,106/-\n\n2.\n\nAY-2011-12\n\n69,290/-\n\n"
++                 "(viii) In our opinion there are no transactions not recorded in books of accounts which have been "
++                 "surrendered or disclosed as income during the year.")
++    a_txt = committed[committed.find("a) According"):committed.find("b) According")].strip()
++    b_txt = committed[committed.find("According to the information and explanations given to us and the records of the company examined by us, there are no statutory"):committed.find("S. No.")].strip()
++
++    def vii(a_cls, a_src, b_cls, b_src):
++        return {"main_clause_id": "vii", "classification": "clean", "normalized_fields": {"source_text": a_src},
++                "sub_clauses": [{"sub_clause_id": "vii_a", "classification": a_cls, "_staged": True, "evidence_text": a_src,
++                                 "evidence_check": "valid", "normalized_fields": {"source_text": a_src}},
++                                {"sub_clause_id": "vii_b", "classification": b_cls, "_staged": True, "evidence_text": b_src,
++                                 "evidence_check": "valid", "normalized_fields": {"source_text": b_src}}]}
++    r = vii("qualified", a_txt, "clean", b_txt)
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=committed)
++    check("V9-7 Fix 2: Committed 2022-23 (vii)(a) arrears listed under 'b)' -> Adverse",
++          r["sub_clauses"][0]["classification"] == "adverse", r["sub_clauses"][0].get("v9_vii_passage"))
++    check("V9-8 Fix 2: Committed 2022-23 (vii)(b) 'no disputed dues' stays Favourable",
++          r["sub_clauses"][1]["classification"] == "clean", r["sub_clauses"][1].get("severity_escalated_by_rule"))
++    starlite = ("(vii) (a) Undisputed statutory dues including Income-tax, Customs Duty, Goods and Service Tax, cess and other "
++                "material statutory dues have generally been regularly deposited with the appropriate authorities.\n(b) "
++                "According to the information and explanations given to us, no undisputed amounts payable in respect of "
++                "income-tax, customs duty, TDS, Goods and Service Tax were in arrears as at 31 March 2021 for a period of "
++                "more than six months from the date they became payable.\n(c) According to the information and explanations "
++                "given to us, the dues which have not been deposited on account of any dispute are as follows:\nName of the "
++                "statute Nature of dues Amount (Rs. in lakhs) Period Forum where the dispute is pending\nAPGST Act Sales tax "
++                "24.27 1996-97 High Court of Telangana\n(viii) There are no transactions not recorded in the books of account.")
++    sa = starlite[starlite.find("(a) Undisputed"):starlite.find("(b) According")].strip()
++    sb = starlite[starlite.find("(b) According"):starlite.find("(c) According")].strip()
++    r = vii("qualified", sa, "clean", sb)
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=starlite)
++    check("V9-9 Fix 2: Starlite 2020-21 disputed APGST table printed as '(c)' -> (vii)(b) Adverse",
++          r["sub_clauses"][1]["classification"] == "adverse", r["sub_clauses"][1].get("v9_vii_passage"))
++    check("V9-10 Fix 2: Starlite (vii)(a) 'no undisputed amounts ... in arrears' is not made Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified")
++    krf = ("(vii) (a) The Company has been generally regular in depositing undisputed statutory dues with the appropriate "
++           "authorities.\n\u2022 According to the information and explanations provided to us, no undisputed amounts payable in "
++           "respect of the\nabove were outstanding, at the year end, for a period of more than six months\nfrom the date when "
++           "they became payable except\nthese two disputes (VAT and CST payable of Rs.\n20,95,74,867 and Rs. 1,00,65,542 "
++           "respectively) are pending before the\nappellate authority.\n(viii) There are no unrecorded transactions.")
++    r = vii("clean", krf[:krf.find("\u2022")].strip(), "adverse", "VAT and CST pending before the appellate authority")
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=krf)
++    check("V9-11 Fix 2 counter-case: K.R. Foods 'no undisputed ... except these two disputes' -> (vii)(a) not Adverse",
++          r["sub_clauses"][0]["classification"] == "clean", r["sub_clauses"][0].get("v9_vii_passage"))
++    rama = ("(vii) a) The Company is regular in depositing undisputed statutory dues with a few delays.\n\nAND\n\nNo undisputed amounts\n"
++            "payable in respect of provident fund, employees' state insurance, income tax, GST,\ncustoms duty, cess and any other "
++            "material statutory dues applicable to it, were\noutstanding, at the year end, for a period of more than six months "
++            "from the\ndate they became payable.\n\n(viii) There are no unrecorded transactions.")
++    r = vii("qualified", "The Company is regular in depositing undisputed statutory dues with a few delays.", "clean", "")
++    P9.apply_adverse_triggers([r], 2020, {"vii"}, caro_text=rama)
++    check("V9-12 Fix 2 counter-case: Rama Cylinders wrapped 'No undisputed amounts ... outstanding' -> not Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified", r["sub_clauses"][0].get("v9_vii_passage"))
++
++    # ---- Fix 3a-3d
++    def one(main, uid, cls, src, oy=2020, caro=None):
++        r = {"main_clause_id": main, "classification": cls, "normalized_fields": {"source_text": src},
++             "sub_clauses": [{"sub_clause_id": uid, "classification": cls, "_staged": True,
++                              "normalized_fields": {"source_text": src}}]}
++        P9.apply_v9_rules([r], oy, caro)
++        return r["sub_clauses"][0]["classification"]
++    check("V9-13 Fix 3a: Mbook (i)(c) 'doesn't hold any immovable properties' -> NA",
++          one("i", "i_c", "clean", "The Company doesn\u2019t hold any immovable properties. Hence reporting under clause 3(i)(c) "
++                                   "of the Order is not applicable.") == "not_applicable")
++    check("V9-14 Fix 3a counter-case: title deeds held in the company's name stays Favourable",
++          one("i", "i_c", "clean", "The title deeds of all the immovable properties disclosed in the financial statements are "
++                                   "held in the name of the company.") == "clean")
++    hdr = ("the title deeds of all the immovable properties (other than properties where the company is the lessee and the "
++           "lease agreements are duly executed in favour of the lessee) disclosed in the financial statements are held in the "
++           "name of the company, except the following: Description of Property Gross carrying value Held in name of Whether "
++           "promoter, director or their relative or employee Period held - indicate range, where appropriate Reason for not "
++           "being held in name of company ")
++    check("V9-15 Fix 3b: Whofers / Maa Kudargarhi empty 'Not Applicable' / 'NA' exception table -> Favourable (G2)",
++          bool(P9._v7_g2("i_c", "QUAL", hdr + "Not Applicable", "", 2020)) and bool(P9._v7_g2("i_c", "QUAL", hdr + "NA", "", 2020)))
++    check("V9-16 Fix 3b counter-case: Committed 2023-24 real property row stays Qualified",
++          not P9._v7_g2("i_c", "QUAL", hdr + "Office at Anand Parbat 100.00 AGR Steel Strips Pvt Ltd No 2010 Registration under process", "", 2020))
++    u29 = ("The aggregate amount of loans or advances in the nature of loans provided during the year, along with the balance "
++           "outstanding as at the balance sheet date, has been disclosed in the financial statements.")
++    check("V9-17 Fix 3c: U29119 (iii)(a)(B) amounts only 'disclosed in the financial statements' -> Qualified",
++          one("iii", "iii_a_B", "clean", u29) == "qualified")
++    check("V9-18 Fix 3c counter-case: (iii)(a)(B) with the amounts printed stays Favourable",
++          one("iii", "iii_a_B", "clean", u29 + " Aggregate amount granted during the year Rs. 28,33,000; balance Rs. 1,12,45,000.") == "clean")
++    apollo = ["a) The Company has not provided loans to others during the current financial year.",
++              "f) The Company has not granted any loan or advance in the nature of loan during the year, which is repayable on "
++              "demand or without specifying any terms or period of repayment."]
++    aditya = ["(iii)(a) During the year, the Company has not provided loans, advances in the nature of loans, stood guarantee or "
++              "provided security to companies, firms, Limited Liability Partnerships or any other parties."]
++    check("V9-19 Fix 3d: Apollo 2021-22 has no whole-clause sentence (blanket NA must not apply)", not P9.v9_whole_clause(apollo))
++    check("V9-20 Fix 3d counter-case: Aditya 2022-23 whole-clause sentence without 'any' still applies",
++          bool(P9.v9_whole_clause(aditya)))
++    rq = {"classification": "qualified", "explanation_text": "Qualified", "evidence_text": apollo[0], "score_ready_fields": {}}
++    rs = {"classification": "qualified", "explanation_text": "Qualified",
++          "evidence_text": "The management has not provided the stock statements to us.", "score_ready_fields": {}}
++    check("V9-21 companion: 'has not provided loans' is not Auditor Unable to Verify; 'has not provided the statements to us' still is",
++          not PL9._check_scope_limitation(rq) and PL9._check_scope_limitation(rs))
++
++    # ---- Fix 4a: D1C ("generally regular", arrears unanswered anywhere in (vii))
++    def vii_a(src, caro):
++        r = {"main_clause_id": "vii", "classification": "clean", "normalized_fields": {"source_text": src},
++             "sub_clauses": [{"sub_clause_id": "vii_a", "classification": "clean", "_staged": True,
++                              "normalized_fields": {"source_text": src}}]}
++        P9.apply_v9_rules([r], 2020, caro)
++        return r["sub_clauses"][0]["classification"]
++    viraj_ref = ("[MCA_BOX: Disclosure relating to regularity in payment of undisputed statutory dues] According to the "
++                 "information and explanations given to us, amounts deducted / accrued in respect of undisputed statutory dues "
++                 "including GST, Provident fund, Income-tax and other material statutory dues have generally been regularly "
++                 "deposited with the appropriate authorities [MCA_BOX: Disclosure in auditors report relating to default in "
++                 "repayment of financial dues] As per Attachment")
++    check("V9-22 Fix 4a: Viraj Refinery 2024-25 'generally regularly deposited', arrears never answered -> Qualified",
++          vii_a(viraj_ref[viraj_ref.find("According"):viraj_ref.find(" [MCA_BOX: Disclosure in auditors report relating to default")],
++                viraj_ref) == "qualified")
++    shripati = ("(vii) a) The Company has generally been regular in depositing undisputed dues, including Provident Fund, Income "
++                "Tax and other material statutory dues as applicable to it with appropriate authorities.\nb) There were no "
++                "undisputed amounts payable in respect of Provident Fund, Income Tax and other material statutory dues as "
++                "applicable in arrears as at 31st March, 2021 for a period of more than six months from the date they became "
++                "payable.\n(viii) There are no unrecorded transactions.")
++    check("V9-23 Fix 4a counter-case: Shripati 2020-21 arrears answered under 'b)' -> stays Favourable",
++          vii_a(shripati[shripati.find("a) The"):shripati.find("b) There")].strip(), shripati) == "clean")
++    stray = ("vii. According to the information and explanations given to us, in respect of statutory dues:\nThe Company has "
++             "generally been regular in depositing undisputed statutory dues, including Provident Fund, Income Tax, Goods and "
++             "Service Tax and other material statutory dues applicable to it with the appropriate authorities.\nThere were no "
++             "undisputed amounts payable in respect of Provident Fund, Employees'\n\nState Insurance, Income Tax, Goods and\n\n"
++             "Service Tax. Customs Duty, Excise Duty, Cess and other material statutory dues in arrears as at March 31, 2024 for "
++             "a period of more than six months from the date they became payable.\n(viii) There are no unrecorded transactions.")
++    check("V9-24 Fix 4a counter-case: Viraj Canes 2023-24 answer with a stray full stop -> stays Favourable",
++          vii_a("The Company has generally been regular in depositing undisputed statutory dues, including Provident Fund, "
++                "Income Tax, Goods and Service Tax and other material statutory dues applicable to it with the appropriate "
++                "authorities.", stray) == "clean")
++
++    # ---- Fix 4b: delay made good -> Qualified; "has defaulted" stays Adverse
++    ix_fav = ("The Company has not defaulted in the repayment of loans or other borrowings or in the payment of interest thereon "
++              "to any lender except some delay.")
++    check("V9-25 Fix 4b: Apollo 2024-25 'not defaulted ... except some delay' (model Favourable) -> Qualified",
++          one("ix", "ix_a", "clean", ix_fav) == "qualified")
++    dly = ("There has been a delay in repayment of interest of Rs. 2,30,000 to Ugro Capital, which was paid on March 29, 2025.")
++    r = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_a", "classification": "qualified", "_staged": True,
++         "evidence_text": dly, "normalized_fields": {"source_text": dly}}]}
++    P9.apply_adverse_triggers([r], 2020, {"ix"})
++    check("V9-26 Fix 4b: a delay that was paid is not escalated to Adverse",
++          r["sub_clauses"][0]["classification"] == "qualified", r["sub_clauses"][0].get("severity_escalated_by_rule"))
++    hard = ("The Company has defaulted in repayment of loans to the following lender: Bank of India, term loan Rs. 45,00,000, "
++            "delay of 92 days, unpaid as at the balance sheet date.")
++    r = {"main_clause_id": "ix", "sub_clauses": [{"sub_clause_id": "ix_a", "classification": "qualified", "_staged": True,
++         "evidence_text": hard, "normalized_fields": {"source_text": hard}}]}
++    P9.apply_adverse_triggers([r], 2020, {"ix"})
++    check("V9-27 Fix 4b counter-case: 'has defaulted' with a delay table stays Adverse (3FATE / Viraj Refinery)",
++          r["sub_clauses"][0]["classification"] == "adverse")
++
++    S9.PATCH_SWITCHES.clear()
++    S9.PATCH_SWITCHES.update(sw)
++
++
++if "--v9-only" in sys.argv:
++    logging.disable(logging.CRITICAL)
++    v9_cases()
++    _fail = [r for r in RESULTS if not r[1]] if RESULTS and isinstance(RESULTS[0], tuple) else []
++    print(f"V9: {sum(1 for r in RESULTS if (r[1] if isinstance(r, tuple) else r))}/{len(RESULTS)} passed")
++    sys.exit(1 if _fail else 0)
++v9_cases()                       # the full suite runs the V9 checks too
++
++
++# ---------------------------------------------------------------------------
++# V10 (15-Oct-2026): production input / output. No label logic is touched (proved by replay).
++# Runs on its own with:  python tests/run_phase2_cases.py --v10-only
++# ---------------------------------------------------------------------------
++def v10_cases():
++    import os as _os, subprocess as _sp, tempfile as _tf, threading as _th, http.server as _hs, json as _js
++    import urllib.request as _ur, urllib.error as _ue
++    from pathlib import Path as _P
++    from caro import logging_setup as LS, sources as SRC, llm as LLM
++    keep = {k: _os.environ.get(k) for k in ("CARO_WRITE_FILES", "CARO_SAVE_ALL", "CIN_SOURCE", "CIN_FOLDER_PATH",
++                                            "LLM_SERVER_RETRIES", "LLM_SERVER_RETRY_WAIT_S")
++            + tuple(LS.SAVE_SWITCHES.values())}
++
++    def env(**kv):
++        for k in keep:
++            _os.environ.pop(k, None)
++        for k, v in kv.items():
++            _os.environ[k] = v
++    # ---- output switches
++    env()
++    check("V10-1 every optional output folder is OFF by default", not any(LS.save_enabled(k) for k in LS.SAVE_SWITCHES))
++    env(CARO_SAVE_XML_OUTPUT="true")
++    check("V10-2 one switch turns on only its own folder (xml_caro_output)",
++          LS.save_enabled("xml_output") and not LS.save_enabled("audit"))
++    env(CARO_SAVE_ALL="true")
++    check("V10-3 CARO_SAVE_ALL=true turns every folder on (local debugging rerun)",
++          all(LS.save_enabled(k) for k in LS.SAVE_SWITCHES))
++    env(CARO_SAVE_ALL="true", CARO_WRITE_FILES="false")
++    check("V10-4 CARO_WRITE_FILES=false still switches everything off", not any(LS.save_enabled(k) for k in LS.SAVE_SWITCHES))
++    # ---- source
++    env()
++    try:
++        SRC.resolve_source(None); ok = False
++    except SRC.SourceNotConfiguredError:
++        ok = True
++    check("V10-5 no source configured -> clear error (never a silent S3 attempt)", ok)
++    env(CIN_FOLDER_PATH="/x")
++    check("V10-6 CIN_FOLDER_PATH set -> local; CIN_SOURCE=s3 only when asked",
++          SRC.resolve_source(None) == "local" and SRC.resolve_source("s3") == "s3")
++    with _tf.TemporaryDirectory() as td:
++        r = _P(td)
++        (r / "U11111MH2000PTC000001" / "Annual Returns and Balance Sheet eForms").mkdir(parents=True)
++        (r / "grp" / "U22222MH2000PTC000002" / "Annual Returns and Balance Sheet eForms").mkdir(parents=True)
++        (r / "a" / "b" / "c" / "d" / "U33333MH2000PTC000003").mkdir(parents=True)
++        c1 = SRC._cin_candidates(r, "U11111MH2000PTC000001")
++        c2 = SRC._cin_candidates(r, "u22222mh2000ptc000002")
++        c3 = SRC._cin_candidates(r, "U33333MH2000PTC000003")
++        check("V10-7 local layouts <root>/<CIN> and <root>/<group>/<CIN> found (case-insensitive); search stops at "
++              "CIN_SEARCH_DEPTH (3)", len(c1) == 1 and len(c2) == 1 and c3 == [], (c1, c2, c3))
++    code = ("import os,sys; os.environ['CIN_FOLDER_PATH']='/tmp'; sys.path.insert(0, %r); import caro.sources as s; "
++            "s.resolve_source(None); print('boto3' in sys.modules)") % str(ROOT)
++    out = _sp.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
++    check("V10-8 local source does not load boto3 (no AWS package or keys needed on the server)", out == "False", out)
++    # ---- one retry on model-server errors
++    state = {"n": 0, "mode": "503_then_ok"}
++
++    class H(_hs.BaseHTTPRequestHandler):
++        def log_message(self, *a):
++            pass
++
++        def do_POST(self):
++            state["n"] += 1
++            self.rfile.read(int(self.headers.get("Content-Length") or 0))
++            m = state["mode"]
++            if m == "400" or (m == "503_then_ok" and state["n"] == 1) or m == "503":
++                self.send_response(400 if m == "400" else 503); self.end_headers(); return
++            body = _js.dumps({"ok": True}).encode()
++            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
++            self.wfile.write(body)
++    srv = _hs.HTTPServer(("127.0.0.1", 0), H)
++    _th.Thread(target=srv.serve_forever, daemon=True).start()
++    url = f"http://127.0.0.1:{srv.server_address[1]}/x"
++    env(LLM_SERVER_RETRY_WAIT_S="0")
++
++    class C:
++        pass
++
++    def call(mode):
++        state.update(n=0, mode=mode)
++        c = C()
++        try:
++            return LLM.post_json(_ur.Request(url, data=b"{}", method="POST"), 5, c), c
++        except Exception as e:                      # noqa: BLE001
++            return e, c
++    r1, c1 = call("503_then_ok")
++    check("V10-9 HTTP 503 then OK -> one retry, the reply is used", r1 == {"ok": True} and c1.server_retries == 1
++          and c1.calls == 2, (r1, vars(c1)))
++    r2, c2 = call("503")
++    check("V10-10 HTTP 503 twice -> exactly one retry, then the error is raised (filing reported Failed)",
++          isinstance(r2, _ue.HTTPError) and c2.calls == 2, (r2, vars(c2)))
++    r3, c3 = call("400")
++    check("V10-11 HTTP 400 (a request problem, not the server) -> no retry", isinstance(r3, _ue.HTTPError) and c3.calls == 1)
++    srv.shutdown(); srv.server_close()
++    r4, c4 = call("ok")
++    check("V10-12 server down -> one retry, then the error", isinstance(r4, (_ue.URLError, OSError))
++          and not isinstance(r4, dict) and c4.calls == 2, (r4, vars(c4)))
++    # ---- summary logging (fresh process: logging is configured once per process)
++    with _tf.TemporaryDirectory() as td:
++        code = ("import os,sys,logging; sys.path.insert(0,%r); os.environ['LOG_DIR']=%r; os.environ['LOG_STYLE']='summary';"
++                "from caro import logging_setup as L; p=L.configure_logging('api');"
++                "logging.getLogger('caro.pipeline').info('DETAIL LINE'); logging.getLogger('caro.pipeline').warning('WARN LINE');"
++                "logging.getLogger('caro.summary').info('SUMMARY LINE'); logging.getLogger('caro.pipeline').error('ERROR LINE');"
++                "print(L.warnings_count()); print(open(p).read())") % (str(ROOT), td)
++        res = _sp.run([sys.executable, "-c", code], capture_output=True, text=True)
++        log = res.stdout
++        check("V10-13 LOG_STYLE=summary: the API log has the summary and errors only; warnings are counted",
++              "SUMMARY LINE" in log and "ERROR LINE" in log and "DETAIL LINE" not in log and "WARN LINE" not in log
++              and log.splitlines()[0] == "1", log[-400:])
++        check("V10-14 LOG_STYLE=summary: the terminal shows the same (no detail lines, no extracted text)",
++              "DETAIL LINE" not in res.stderr and "SUMMARY LINE" in res.stderr, res.stderr[-300:])
++    # ---- per-CIN summary block
++    from caro import cin_pipeline as CP
++    import logging as _lg
++    rec = []
++
++    class _R(_lg.Handler):
++        def emit(self, r):
++            rec.append(r.getMessage())
++    hd = _R(); _lg.getLogger("caro.summary").addHandler(hd); _lg.getLogger("caro.summary").setLevel(_lg.INFO)
++    _was = _lg.root.manager.disable
++    _lg.disable(_lg.NOTSET)
++    fake = {"metadata": {"filings": [{"financial_year": "2023-24", "status": "Success", "caro_order_year": 2020,
++                                      "company_name": "TEST CO"},
++                                     {"financial_year": "2022-23", "status": "Failed", "error": "Call 2 cut off twice"}]},
++            "result": [{"financial_year": "2023-24", "red_flag_clause_ids": ["vii"],
++                        "CARO_clauses": [{"classification": "Adverse Remark"}, {"classification": "Qualified Remark"}],
++                        "CARO_ews": [{"score_ready_fields": {"review_required_flag": True}, "sub_clause_ews": []}]},
++                       {"financial_year": "2022-23", "CARO_clauses": [], "CARO_ews": []}]}
++    CP._log_cin_summary("U00000MH2000PTC000009", fake, 125.0, 4, 1)
++    _lg.getLogger("caro.summary").removeHandler(hd)
++    _lg.disable(_was)
++    txt = "\n".join(rec)
++    check("V10-15 per-CIN summary: one line per year, red flags, result; at most 15 lines",
++          len(rec) <= 15 and "ADV 1  QUAL 1" in txt and "FAILED" in txt and "Call 2 cut off" in txt and "(vii)" in txt
++          and "PARTIAL 1/2" in txt and "server retries 1" in txt, txt)
++    # ---- no debug printing in the production code path
++    bad = []
++    for f in ("sources.py", "cin_pipeline.py", "pipeline.py", "staged_llm.py", "post_rules.py", "llm.py", "audit.py",
++              "runner.py", "extract.py", "xml_caro_extractor.py"):
++        for i, line in enumerate((ROOT / "caro" / f).read_text(encoding="utf-8").splitlines(), 1):
++            t = line.strip()
++            if t.startswith("print(") and "file=sys.stderr" not in t:
++                bad.append(f"{f}:{i}")
++    check("V10-16 no print() in the production code path (nothing of the document reaches the terminal)", not bad, bad)
++    env(**{k: v for k, v in keep.items() if v is not None})
++
++
++if "--v10-only" in sys.argv:
++    logging.disable(logging.CRITICAL)
++    v10_cases()
++if "--v10-only" not in sys.argv:
++    v10_cases()                  # the full suite runs the V10 checks too
++
++
++def v10_table_cases():
++    """V10-17 ... V10-23: disputed_dues_table[].amount in absolute rupees (Toby 15-Oct-2026)."""
++    from caro import amounts as AM
++
++    def run(rows, text, items=None, total=None):
++        rec = {"main_clause_id": "vii", "normalized_fields": {"disputed_dues_table": rows, "amount_total": total,
++                                                              "source_text": text},
++               "amount_calc": {"items": [{"as_printed": p, "rupees": v} for p, v in (items or [])]}, "sub_clauses": []}
++        AM.absolute_table_amounts([rec], text)
++        return [r.get("amount") for r in rec["normalized_fields"]["disputed_dues_table"]], rec
++    apollo = ("(vii) b) The dues which have not been deposited on account of dispute are:\nName of the statute Nature of dues "
++              "Forum where dispute is pending Period to which the amount relates Amount\n(Rs. In Lacs)\nIncome-tax Act, 1961 "
++              "Income-tax Income Tax Appellate Tribunal Assessment Year 2016-17 22.95*\nIncome-tax Act, 1961 Income-tax "
++              "CIT (Appeals) Assessment Year 2017-18 185.59*")
++    got, _ = run([{"nature_of_dues": "Income-tax", "period": "Assessment Year 2016-17", "amount": "22.95*"},
++                  {"nature_of_dues": "Income-tax", "period": "Assessment Year 2017-18", "amount": "185.59*"}],
++                 apollo, [("22.95*", 2295000.0), ("185.59*", 18559000.0)], 20854000.0)
++    check("V10-17 Apollo 2020-21: '22.95*' and '185.59*' under (Rs. In Lacs) -> 2295000.0 and 18559000.0", got == [2295000.0, 18559000.0], got)
++    got, _ = run([{"amount": "22.95*"}, {"amount": "185.59*"}], apollo)
++    check("V10-18 same rows with no amount_total working: the table heading alone gives the same values",
++          got == [2295000.0, 18559000.0], got)
++    got, _ = run([{"amount": "Rs. 20,95,74,867 and Rs. 1,00,65,542 respectively"}], "VAT and CST Rs. 20,95,74,867 and "
++                 "Rs. 1,00,65,542 respectively are pending before the appellate authority")
++    check("V10-19 K.R. Foods: two figures in one cell are added (VAT + CST = 21,96,40,409)", got == [219640409.0], got)
++    got, _ = run([{"amount": "15,410/-"}, {"amount": "714,067"}, {"amount": "7383 Thousand"}], "statutory dues table")
++    check("V10-20 figures in full rupees / with a unit word: '15,410/-', '714,067', '7383 Thousand'",
++          got == [15410.0, 714067.0, 7383000.0], got)
++    got, rec = run([{"amount": "2011-12, 2012-13"}, {"amount": "Rs. in lakhs"}, {"amount": "-"}], "disputed dues table")
++    check("V10-21 Aditya 2023-24: a period or a heading in the amount column is never turned into money; kept as "
++          "printed and sent for review", got == ["2011-12, 2012-13", "Rs. in lakhs", "-"]
++          and "table_amount_unit_unclear" in rec.get("review_reasons", []), (got, rec.get("review_reasons")))
++    got, rec = run([{"amount": "22.95"}], "disputed dues table with no unit heading")
++    check("V10-22 a decimal figure with no unit anywhere is not guessed (kept, review) - same rule as amount_total",
++          got == ["22.95"] and "table_amount_unit_unclear" in rec.get("review_reasons", []), got)
++    check("V10-23 the heading 'Rs.( Lakh)' is a unit heading (K C India: 149.23 -> Rs 1,49,23,000)",
++          AM.unit_heading("Act\nPeriod\nAmount\nRs.( Lakh)\nRemarks") == 100000.0
++          and run([{"amount": "149.23"}], "following demand is payable on account of any disputes.\nAct\nPeriod\nAmount\n"
++                  "Rs.( Lakh)\nRemarks\n\nThe Income Tax Act 1961\nAY 2018-19\n149.23\nAppeal filed before CIT(A)")[0] == [14923000.0])
++
++
++if "--v10-only" in sys.argv:
++    v10_table_cases()
++    print(f"V10 (with tables): {sum(1 for r in RESULTS if r[1])}/{len(RESULTS)} passed")
++    sys.exit(0 if all(r[1] for r in RESULTS) else 1)
++v10_table_cases()
++
++
++# ---------------------------------------------------------------------------
+ # fixtures (texts already in the repository + the two synthetic filings below)
+ # ---------------------------------------------------------------------------
+ def _payload_annexure():
+@@ -757,7 +1186,10 @@
+ staged = {}
+ # PATCH 14-Oct-2026 (v7): G1-G7 prove the two-call PLUMBING adds nothing, so they run with the v7 convention rules off
+ # (v7 changes labels on purpose after the model; its effect on these fixtures is checked in V7-7 below).
+-_V7_SW = ("V7_G1", "V7_G2", "V7_G3", "V7_G4", "V7_G7", "V7_G8")
++_V7_SW = ("V7_G1", "V7_G2", "V7_G3", "V7_G4", "V7_G7", "V7_G8",
++          # PATCH 15-Oct-2026 (v9): label-changing v9 rules are off for the plumbing checks too (checked in V9-*)
++          "V9_QSTRIP", "V9_VII_PASSAGE", "V9_IC_NOPROP", "V9_G2_HEADER", "V9_D3_DISCLOSED", "V9_BLANKET_GATE",
++          "V9_SCOPE_LOANS", "V9_D1C", "V9_DELAY_QUAL")
+ _v7_saved = {k: st.PATCH_SWITCHES[k] for k in _V7_SW}
+ st.PATCH_SWITCHES.update({k: False for k in _V7_SW})
+ for name in FIX:
+--- a/.env.example
++++ b/.env.example
+@@ -23,18 +23,16 @@
+ LLM_THINK=false
+ LLM_GUIDED_JSON=true
+ LLM_BATCH_SIZE=3
+-# Phase 2 (09-Oct-2026, Option A): which LLM flow to use. single = today's one call per
+-# filing (default, the rollback). staged = two calls (Call 1 places the auditor's text
+-# under each CARO clause; Call 2 checks that mapping by subject and classifies); any
+-# problem falls back to the single call for that filing. Keep "single" until the
+-# Phase 2 gate passes.
+-# The staged calls need structured output on the server: set
+-# LLM_STRUCTURED_OUTPUT=response_format if vLLM ignores guided_json (N4).
+-# Test mode: staged_nofallback = two calls only, never the single call; a check that would
+-# normally send a filing back to the single call is only written to the audit file
+-# (llm_reply.staged.would_fall_back). Use it to inspect the two-call result itself;
+-# do not use it for client output.
+-CARO_LLM_FLOW=single
++# Which LLM flow to use. PRODUCTION (v9, 15-Oct-2026): the two-call flow ONLY (Call 1 extract and map,
++# Call 2 check and classify), never a fallback to the single call. Leave this unset (or "staged").
++# A filing whose two calls fail is reported "Failed" and listed for a rerun.
++#   single = the old one-call prompt: EMERGENCY ROLLBACK ONLY.
++# The staged calls need structured output on the server: LLM_STRUCTURED_OUTPUT=response_format.
++CARO_LLM_FLOW=staged
++# Model-server problems (cannot connect, timeout, HTTP 5xx/429) are retried this many times after this
++# many seconds. The request is identical, so a retry cannot change a label.
++LLM_SERVER_RETRIES=1
++LLM_SERVER_RETRY_WAIT_S=30
+ 
+ # ---- local working directories for --cin mode --------------------------
+ CIN_DOWNLOAD_DIR=./cin_downloads
+@@ -54,6 +52,30 @@
+ # normal — this only silences the progress/status logging. Same as
+ # passing --no-log on the CLI.
+ LOG_DISABLE=false
++# summary (production): the terminal and the API log show only a short block per CIN (start, one line
++#   per financial year, red flags, result) and errors; warnings are counted, not shown.
++# detailed: every step, as before - use it when investigating a problem.
++LOG_STYLE=summary
++
++# ---- production input: filings already on the server (no S3 download) ---
++# CIN_FOLDER_PATH is the folder that CONTAINS the CIN folders:
++#   <CIN_FOLDER_PATH>/<CIN>/Annual Returns and Balance Sheet eForms/...
++# Files are read in place; nothing in that folder is copied, moved or deleted.
++# (CIN_SOURCE and CIN_FOLDER_PATH are set further down, in the "where filings come from" section.)
++# How many folder levels below CIN_FOLDER_PATH a CIN folder is searched for.
++CIN_SEARCH_DEPTH=3
++
++# ---- optional output folders (production: all OFF) -----------------------
++# The API log (LOG_DIR) and the result JSON are always written. Everything below is for
++# investigating a problem: turn one on, or CARO_SAVE_ALL=true for a full local rerun.
++CARO_SAVE_XML_OUTPUT=false        # xml_caro_output/  (folder: CARO_XML_OUTPUT_DIR)
++CARO_SAVE_EXTRACTED_TEXT=false    # logs/extracted_text/   - the CARO text sent to the model
++CARO_SAVE_LLM_REPLIES=false       # logs/extracted_llm_out/ - the raw model replies (needed for a replay)
++CARO_SAVE_AUDIT=false             # logs/caro_audit/        - what each rule changed and why
++CARO_SAVE_PERF=false              # logs/perf/              - timing workbook
++CARO_SAVE_FY_TRACKING=false       # fy_tracking.csv (in CARO_XML_OUTPUT_DIR)
++CARO_SAVE_CIN_LOGS=false          # logs/cin/               - one detailed log per CIN
++CARO_SAVE_ALL=false
+ 
+ 
+ # ---- OCR (Non-XBRL / scanned filings) -----------------------------------
+@@ -141,7 +163,8 @@
+ 
+ # ---- Document source -----------------------------------------------------
+ # Where filing PDFs come from: local | s3
+-# If unset, inferred as "local" when CIN_FOLDER_PATH is set, else "s3".
++# If unset: "local" when CIN_FOLDER_PATH is set; otherwise the run stops with a clear error
++# (S3 is never used unless CIN_SOURCE=s3). Production: local.
+ CIN_SOURCE=local
+ 
+ # [local] Root folder holding already-extracted CIN folders. Read-only:

@@ -1,0 +1,434 @@
+--- /tmp/claude-0/-home-claude/917aa1f3-a274-51e1-b8f0-b7e625621980/scratchpad/pkg_v5/caro/amounts.py	2026-10-14 07:20:07.754887725 +0000
++++ caro/amounts.py	2026-10-14 11:46:37.273069858 +0000
+@@ -48,7 +48,8 @@
+ MULT = {"crore": 1e7, "crores": 1e7, "cr": 1e7, "cr.": 1e7, "crs": 1e7,
+         "lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5, "lakh.": 1e5, "l": 1e5,
+         "million": 1e6, "millions": 1e6, "mn": 1e6, "billion": 1e9, "bn": 1e9,
+-        "thousand": 1e3, "thousands": 1e3, "k": 1e3, "'000": 1e3, "000": 1e3}
++        "thousand": 1e3, "thousands": 1e3, "k": 1e3, "'000": 1e3, "000": 1e3,
++        "hundred": 1e2, "hundreds": 1e2}      # v6 (14-Oct): "(Rs. in hundreds)", "(Rs. in '000)"
+ 
+ # units whose amount is ONE figure: the first one printed. (xvii) cash losses:
+ # the Order's wording gives the current year first, then the preceding year,
+@@ -58,7 +59,11 @@
+ SUMMABLE = {2020: {"vii_a", "vii_b", "vii", "ix_a", "xi_a", "xx_a", "xx_b", "xx"},
+             2016: {"vii_a", "vii_b", "vii", "viii", "x"}}
+ 
+-_UNIT_WORD = r"(crores?|cr\.?|crs|lakhs?|lacs?|million|mn|billion|bn|thousands?)"
++# v6 (14-Oct, Toby: "only numeric units like lakhs, crores, hundred, thousand"): "hundred(s)" and "'000"
++# ("(Rs. in '000)", "(₹ ’000)") are read as multipliers; before v6 a figure under such a heading was
++# taken as rupees (100 / 1,000 times too small). Land and quantity words are never units (see _AREA,
++# _QTY_AFTER). Words without digits ("rupees five hundred crore") are never figures.
++_UNIT_WORD = r"(crores?|cr\.?|crs|lakhs?|lacs?|million|mn|billion|bn|thousands?|hundreds?|['’‘`]\s?000s?(?![\d,]))"
+ 
+ 
+ # PATCH 7-Oct (Phase 1, F15) -- column / table headings.
+@@ -91,7 +96,12 @@
+ 
+ 
+ def _mult(word: Optional[str]) -> float:
+-    return MULT.get((word or "").strip().lower().rstrip("."), 1.0) if word else 1.0
++    if not word:
++        return 1.0
++    w = word.strip().lower().rstrip(".")
++    if re.fullmatch(r"['’‘`]\s?000s?", w):
++        return 1e3
++    return MULT.get(w, 1.0)
+ 
+ 
+ # 30-Sep (run-2 fix 2): a PDF render interleaves the table's header cells, so the
+@@ -529,7 +539,12 @@
+                           r"|following|[:;]\s*$", re.I)
+ _SUB_MARK = re.compile(r"(?m)^[ \t]*\(?\s*[a-h]\s*\)[ \t]?|^[ \t]*\(?\s*[ivx]{1,5}\s*\)\s*\(\s*[a-h]\s*\)")
+ _PAID_WORDS = re.compile(r"under protest|amount paid|paid under|deposited under|pre-?deposit|(?<!not )\bpaid on\b", re.I)
+-_AREA = re.compile(r"acre|hectare|ghunt|guntha|bigha|\bsq\.?\s*(?:ft|feet|m|mt|metre|meter|yd)|square|\barea\b", re.I)
++_AREA = re.compile(r"acre|hectare|ghunt|guntha|bigha|biswa|\bkanals?\b|\bmarlas?\b|\bkath?thas?\b|\bcents\b"
++                   r"|\bsq\.?\s*(?:ft|feet|m|mt|mtrs?|metre|meter|yd|yards?)|square|\barea\b", re.I)
++# v6 (14-Oct): the word printed right after a figure that makes it a count, a rate or a period - never rupees
++_QTY_AFTER = re.compile(r"[ \t]*(?:(?:equity|preference|fully[ \t]+paid(?:[ \t-]+up)?)[ \t]+)*(?:shares?|units?|nos?\.?|numbers?"
++                        r"|esops?|options?|warrants?|debentures?|employees|persons|per[ \t]*cent|percent|days?|months?"
++                        r"|years?|times|mt|tonnes?|kgs?|decimals?)\b|[ \t]*%", re.I)   # same line, whole word only
+ _INCL_INTEREST = re.compile(r"^[^.;\n]{0,40}?(?:includ\w*|inclusive\s+of|along\s+with|together\s+with)\s+(?:the\s+)?interest", re.I)
+ 
+ 
+@@ -714,6 +729,7 @@
+     "EVIDENCE_SHOWS_AMOUNT": False, # source_text gets the table row / sentence of a counted figure (off: needs placement fix first)
+     "OWN_CLAUSE_ONLY": True,  # a figure must be printed in this clause's own passage (not another clause's)
+     "ALL_FALSE_RECOVER": True,  # 13-Oct trial run: every figure marked "not counted" -> the code checks decide
++    "NOT_QTY": True,  # v6 (14-Oct): a figure followed by shares / numbers / % / days / months / years is never rupees
+ }
+ 
+ 
+@@ -744,7 +760,7 @@
+ _SUBMARK = re.compile(r"(?m)^[ \t]*\(?\s*[a-h]\s*\)[ \t]?\S|^[ \t]*\(?\s*[ivx]{1,5}\s*\)\s*\(\s*[a-h]\s*\)")
+ _INTRO = re.compile(r"as follows|as under|here\s*under|given below|mentioned below|details below|[:]\s*$", re.I)
+ _UNIT_LINE = re.compile(r"^\s*\(?\s*(?:amount\s*)?(?:\(?\s*(?:rs\.?|₹|inr|rupees)\s*\)?\s*)?(?:in\s+)?"
+-                        r"(?:rupees\s+)?(?:crores?|lakhs?|lacs?|thousands?|rs\.?|₹|inr)?\s*\)?\s*$", re.I)
++                        r"(?:rupees\s+)?(?:crores?|lakhs?|lacs?|thousands?|hundreds?|['’‘`]\s?000s?|rs\.?|₹|inr)?\s*\)?\s*$", re.I)
+ _DATE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]((?:19|20)\d\d)\b|\b31(?:st)?\s*(?:march|mar\.?),?\s*((?:19|20)\d\d)\b", re.I)
+ _MONEYCOL = re.compile(r"amount|balance|disput|protest|deposit|paid|given|granted|during the year|opening|closing"
+                        r"|outstanding|guarantee|loan|advance|investment|security|difference|value as per|\bin\s+rs\b|\(\s*in\s+rs", re.I)
+@@ -887,7 +903,7 @@
+             break
+         if re.fullmatch(r"\(?\s*(?:rs\.?|₹|inr)\s*\.?\s*\)?", s, re.I) or _UNIT_LINE.match(s) and len(s) < 30 \
+                 and not re.match(r"amount\b", s, re.I) \
+-                and not re.search(r"[A-Za-z]{4,}", re.sub(r"(?i)crores?|lakhs?|lacs?|thousands?|amount|rupees", "", s)):
++                and not re.search(r"[A-Za-z]{4,}", re.sub(r"(?i)crores?|lakhs?|lacs?|thousands?|hundreds?|amount|rupees", "", s)):
+             if header and len(s) < 12:
+                 header[-1] += " " + s              # "(Rs.)" under "Amount Disputed"
+             continue
+@@ -1177,8 +1193,15 @@
+             # the (v) deposits figure "Rs. 7383 thousand" taken as the (vii)(a) arrears amount)
+             why = "figure_of_another_clause"
+         elif amt_switch_on("NOT_MONEY") and (_AREA.search(str(printed)) or _AREA.match(after.strip()[:12] or "x-x")
+-                                    or re.match(r"\s*(?:acres?|hectares?|ghunt\w*|guntha|sq)", after, re.I)):
++                                    or re.match(r"\s*(?:acres?|hectares?|ghunt\w*|guntha|sq)", after, re.I)
++                                    or re.match(r"\s*(?:bighas?|biswas?|kanals?|marlas?|kath?thas?|cents|decimals?)\b",
++                                                after, re.I)):
+             why = "area_not_money"
++        elif amt_switch_on("NOT_QTY") and pos >= 0 and _QTY_AFTER.match(full_text[pos + len(num): pos + len(num) + 40]) \
++                and not (_FIG.search(str(printed)) or _FIG.search("0")).group("unit") \
++                and not re.search(r"(?:rs\.?|₹|inr|rupees)\s*\.?\s*$", before, re.I) \
++                and not re.search(r"(?:rs\.?|₹|inr|rupees)", str(printed), re.I):
++            why = "count_or_period_not_money"
+         elif amt_switch_on("NOT_MONEY") and pos >= 0 and _THRESHOLD_BEFORE.search(before[-40:]) \
+                 and v is not None and abs(v - 5e7) < 1 and re.search(r"working\s+capital|sanction", sent, re.I):
+             why = "threshold_not_amount"
+--- /tmp/claude-0/-home-claude/917aa1f3-a274-51e1-b8f0-b7e625621980/scratchpad/pkg_v5/caro/staged_llm.py	2026-10-14 07:20:07.755174654 +0000
++++ caro/staged_llm.py	2026-10-14 11:46:37.273357476 +0000
+@@ -62,6 +62,14 @@
+ 
+ # PATCH 12-Oct-2026 (Phase 2, batch 12-Oct). WHY: every fix of this batch can be switched off on its own
+ # by setting its entry to False here (no new .env switch). Fix ids as in the 11-Oct audit workbook.
++# v6 (14-Oct trial, Siddhivinayak 2024-25): the recheck reply was given the whole remaining context
++# (~23,000-35,000 tokens) and ran for 600 s until the HTTP timeout; the filing was lost although its
++# first Call 2 answers were complete. The largest recheck reply in all runs so far is 18,465 characters
++# (about 6,000 tokens), so 12,000 tokens is twice that. A reply that hits the cap is "cut off": its
++# complete records are kept and every other unit keeps its first answer. The model's text up to the
++# cap is the same (temperature 0); only a runaway reply is stopped earlier.
++RECHECK_MAX_TOKENS = 12000
++
+ PATCH_SWITCHES = {
+     "CUTOFF": True,   # F01-F04: cut-off / broken-JSON handling instead of the copy-loop rejection
+     "F05": True,      # CARO 2016 (ix): both halves (public offer AND term loans) - rule + recheck note
+@@ -84,34 +92,39 @@
+     "XWALK_LAYOUT": False,  # v5: OFF (changes the Call 1/2 requests on 2016-layout filings)  # crosswalk only for real CARO 2016 / hybrid layouts; mixed numbering -> subject-only note
+     "SUBJ_2016": False,     # v5: OFF (changes the Call 2 request for CARO 2016 filings)     # CARO 2016 units get the subject words of their CARO 2020 successor (clause map)
+     "ONE_UNIT": False,      # v5: OFF (prompt text)      # Call 1: a unit's source_text answers only its own question; Call 2: judge the whole text
+-    "F35": True,           # recheck note: a unit's OWN text is on another unit's subject / is only the printed question
++    "F35": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |           # recheck note: a unit's OWN text is on another unit's subject / is only the printed question
+     "MOVE_PASSAGE": True,  # a Call 2 move of clause-passage words to another unit is applied (words verified)
+     "OWN_TEXT": True,      # post_rules: a label is softened only when the unit's own clean text agrees
+     "TABLE_QUOTE": True,   # a table quote the model re-wrote is replaced by the auditor's own lines
+     # 13-Oct evening batch (register P-ids; Toby approved 13-Oct 20:27). Each can be switched off on its own.
+-    "P1": True,    # TRIAL - (vii)(b) with no dispute text: the dispute sentence / table of the (vii) paragraph in a note
++    "P1": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |    # TRIAL - (vii)(b) with no dispute text: the dispute sentence / table of the (vii) paragraph in a note
+     "P2": True,    # "hence / accordingly not applicable" after a favourable finding: note + NA/clean table (code)
+-    "P2_PROMPT": False,  # v5: the P2 prompt LINE only - OFF (prompt frozen)
++    "P2_PROMPT": False,
++    "P2_NOTE": False,    # v6: the P2 recheck NOTE only - OFF (P2 itself stays on for the post_rules NA/clean table)  # v5: the P2 prompt LINE only - OFF (prompt frozen)
+     "P4": False,   # v5: OFF (prompt line)    # (iii)(a) is judged on the amounts only (prompt line)
+     "P5": True,    # a move target takes the recheck answer only when the moved words really changed its text
+-    "P6": True,    # F16: a negation anywhere before the name in the sentence; keep (B)'s own denial
++    "P6": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |    # F16: a negation anywhere before the name in the sentence; keep (B)'s own denial
+     "P7A": True,   # TRIAL - post_rules: CSR "s.135 applicable but has not been complied with" -> adverse trigger
+     "P7B": False,  # v5: OFF - 14-Oct run: 1 wrong change, 0 right, 4 notes on "following: Nil"   # TRIAL - note: particulars announced ("as under", "following") but not given -> dangling
+-    "P7C": True,   # TRIAL - note: (vii)(a) answer while arrears > 6 months are listed in its own text
+-    "P7D": True,   # TRIAL - note: (xiv)(a) internal audit required but not carried out
+-    "P7E": True,   # TRIAL - note: "insufficient" although the model's own explanation calls the answer incomplete
+-    "P8": True,    # note: an explanation that guesses ("implying", "presumably", "by default")
++    "P7C": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |   # TRIAL - note: (vii)(a) answer while arrears > 6 months are listed in its own text
++    "P7D": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |   # TRIAL - note: (xiv)(a) internal audit required but not carried out
++    "P7E": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |   # TRIAL - note: "insufficient" although the model's own explanation calls the answer incomplete
++    "P8": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |    # note: an explanation that guesses ("implying", "presumably", "by default")
+     "P10": True,   # post_rules: no NA from a sentence with a carve-out / another sub-clause's marker or subject
+     "P11": True,   # post_rules: wordings the rules missed (intangibles, (iv) director loans, "unable to say")
+-    "P13": True,   # Call 1: source_text limit per filing; a runaway field is cut, a long field asked once more (+20%)
++    "P13": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |   # Call 1: source_text limit per filing; a runaway field is cut, a long field asked once more (+20%)
+     "P15": False,  # v5: OFF (prompt line)   # (viii) convention example (prompt line)
+-    "P16": True,   # TRIAL - note: "except as given in Para (b)" -> the paragraph it points to, from its own clause
++    "P16": False,  # v6: OFF - a recheck note changes the recheck request (14-Oct trial) |   # TRIAL - note: "except as given in Para (b)" -> the paragraph it points to, from its own clause
+     "P18": False,  # v5: OFF (prompt line)   # (x)(b): rights issue / allotment without a compliance statement (prompt line)
+     # 13-Oct trial run (3 CINs) - corrections
+     "GUARD_INCOMPLETE": True,  # own-question guard: an INCOMPLETE answer naming its own missing figures is not cross-clause
++    "GUARD_INCOMPLETE_NOTE": False,  # v6: GUARD_INCOMPLETE acts only in the FINAL guard (no change to the recheck request)
+     "SCOPE_OWN": True,
+     # 14-Oct full run (v5)
+-    "NA_PUSH_V5": True,        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
++    "NA_PUSH_V5": True,
++    # 14-Oct trial (v6) - no request content changes
++    "P17_ADV": True,           # post_rules (code): undisputed arrears > 6 months LISTED by the auditor -> Adverse (Toby 14-Oct; D14: no amount needed)
++    "RECHECK_GUARD": True,     # the recheck reply is capped (RECHECK_MAX_TOKENS) and a network error / timeout in the recheck keeps the first answers instead of failing the filing        # post_rules: no NA pushed down when the main affirms loans or the NA sentence names another clause         # a could-not-verify sentence must be on the unit's own subject, not only a sibling's
+ }
+ # PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
+ # "trial:<fix>" (an existing review_reasons value, no new JSON key) so the run shows every effect. Remove a fix
+@@ -1821,7 +1834,7 @@
+         # "cross-clause / inconsistent / contradicts", or something of ANOTHER clause (named by its
+         # number, or by its subject words absent from this unit's own text) said to be missing
+         absent = bool(_ABSENCE_CUE.search(expl))
+-        if (_on("GUARD_INCOMPLETE") and absent and basis == "incomplete" and own == cls and not _CROSS_CUE.search(expl)
++        if (_on("GUARD_INCOMPLETE") and (final or _on("GUARD_INCOMPLETE_NOTE")) and absent and basis == "incomplete" and own == cls and not _CROSS_CUE.search(expl)
+                 and not by[uid]["has_subs"] and _incomplete_on_own_subject(uid, expl, by, own_text0)):
+             # PATCH 13-Oct-2026 (trial run, K.R. Foods 2021-22 (iii)(a)(A)/(B)): "does not disclose the aggregate
+             # amounts ... required for this sub-clause" names THIS unit's own missing particulars - an INCOMPLETE
+@@ -2527,7 +2540,7 @@
+                          "part of this unit's answer - judge this unit on both (move the words here); if it is on "
+                          "another unit's subject, judge this unit on its own words only", block=blk[:300])
+         # ---- P2 favourable finding + "hence not applicable" outside (ix)(e)/(f) --------------------
+-        if _on("P2") and not _is_2016(order_year) and uid in _P2_NOTE_UNITS and cls == "not_applicable" and own:
++        if _on("P2") and _on("P2_NOTE") and not _is_2016(order_year) and uid in _P2_NOTE_UNITS and cls == "not_applicable" and own:
+             fav = _P2_FAV.search(own)
+             if fav and not _P2_NOT_ARISE.search(own):
+                 note(uid, "P2", "this text states a finding ('" + own[max(0, fav.start() - 40):fav.end() + 40].strip()
+@@ -3099,7 +3112,10 @@
+         n2["recheck"] = recheck
+         if b_tags:
+             n2["recheck_fix_tags"] = {u: sorted(v) for u, v in b_tags.items()}
++        _cap_prev = getattr(client, "max_tokens", None)
+         try:
++            if _on("RECHECK_GUARD") and isinstance(_cap_prev, int) and _cap_prev > RECHECK_MAX_TOKENS:
++                client.max_tokens = RECHECK_MAX_TOKENS        # v6: see RECHECK_MAX_TOKENS
+             obj2c = _ask(client, 2, sys2, build_call2_user(company, fy, order_year, _payload(
+                 cat, units, hints, only_mains={by[u]["main"] for u in recheck} | b_mains, recheck=recheck), []),
+                 call2_schema(), _dump, n2, "recheck")
+@@ -3132,6 +3148,13 @@
+                         _trace(n, "MOVE", "unit answered with the words moved to it", t)
+         except StageError as e:                                       # the first answers + final guard stand
+             n2["recheck_failed"] = str(e)[:200]
++        except (TimeoutError, OSError) as e:                          # v6 (RECHECK_GUARD): network error / timeout
++            if not _on("RECHECK_GUARD"):
++                raise
++            n2["recheck_failed"] = f"{type(e).__name__}: {str(e)[:180]}"
++        finally:
++            if _cap_prev is not None and getattr(client, "max_tokens", None) != _cap_prev:
++                client.max_tokens = _cap_prev
+     denial_list_guard(ans, units, by, final=True, notes=n)
+     unanswered_text_guard(ans, units, by, final=True, notes=n)
+     settle_text(units, ans, by, n)
+--- /tmp/claude-0/-home-claude/917aa1f3-a274-51e1-b8f0-b7e625621980/scratchpad/pkg_v5/caro/post_rules.py	2026-10-14 07:20:07.755458067 +0000
++++ caro/post_rules.py	2026-10-14 11:46:37.273880388 +0000
+@@ -736,12 +736,75 @@
+ # single-point clauses). The main-clause id of a clause WITH sub-clauses is
+ # listed too; it is only evaluated when the LLM returned that main clause with
+ # NO sub-clauses (otherwise the subs carry the finding and roll up).
++# PATCH 14-Oct-2026 (P17, Toby: "arrears over six months - consider it adverse"; D14 of 8-Oct: no amount needed).
++# WHY: R_ARREARS needs a printed amount and treats "no undisputed amounts ... except following ... were in arrears
++# ... more than six months" as a denial, so a listed arrear stayed Qualified (Ichalkaranji 2021-22 / 2023-24,
++# Aditya 2021-22 / 2024-25, Committed Ispat 2022-23). This rule fires when the auditor AFFIRMS undisputed arrears
++# older than six months: an affirmative sentence, or a denial with an "except (the) following / as follows / as
++# under / below" exception that is not followed by Nil. A dispute sentence or a dispute table (forum / appellate)
++# is (vii)(b) and never fires it. Two-call records only (staged_patch), switch PATCH_SWITCHES["P17_ADV"].
++_P17_ARREARS = re.compile(r"(?:\bin\s+arrears|\barrears\b|\boutstanding\b|\bpayable\b)[^.]{0,260}?(?:more\s+than|exceeding|over)\s+"
++                          r"(?:six|6)\s+months|(?:more\s+than|exceeding)\s+(?:six|6)\s+months[^.]{0,160}?\b(?:arrears|outstanding)\b",
++                          re.I)
++_P17_NEG = re.compile(r"\b(?:no|nil|none|not|never)\b", re.I)
++_P17_EXCEPT = re.compile(r"\bexcept(?:\s+for)?(?:\s+as)?\s+(?:the\s+)?(?:following|follows|under|below|(?:mentioned|given|stated|"
++                         r"detailed|shown)\s+below)\b", re.I)
++_P17_FOLLOWS = re.compile(r"\b(?:following|as\s+follows|as\s+under|given\s+below|mentioned\s+below)\b", re.I)
++_P17_NIL_AFTER = re.compile(r"^\W{0,6}(?:nil|none|not\s+applicable|n\.?a\.?)\b", re.I)
++
++
++class _ListedArrearsRule(_Rule):
++    def hit(self, text: str) -> Optional[str]:
++        for sent in _sentences(text):
++            if _QUESTION_RE.match(sent) or sent.rstrip().endswith("?"):
++                continue
++            sent = _DEGLUE_RE.sub(r"\1 \2", sent)
++            if not _P17_ARREARS.search(sent):
++                continue
++            if re.match(r"^\W*(?:\(?[a-h]\)\s*)?the\s+extent\s+of\s+(?:the\s+)?arrears", sent, re.I):
++                continue                                   # the Order's own question wording, no answer
++            if _DISPUTE_TABLE_RE.search(re.sub(r"(?i)undisputed", "", sent)):
++                continue                                   # a dispute -> (vii)(b)
++            i = text.find(sent)
++            after = text[i + len(sent): i + len(sent) + 600] if i >= 0 else ""
++            cut = _FOLLOW_STOP_RE.search(after)
++            if cut:
++                after = after[:cut.start()]
++            neg = _P17_NEG.search(re.sub(r"(?i)\bnot\s+(?:yet\s+)?(?:been\s+)?(?:deposited|paid|remitted)\b", "", sent))
++            if not neg and i > 0:
++                # a denial cut by a stray full stop ("There were no undisputed amounts payable in respect of ...
++                # Service Tax. Customs Duty ... in arrears ... more than six months" - Viraj Canes 2023-24)
++                before = text[max(0, i - 400):i]
++                dn = list(re.finditer(r"\b(?:no|nil|none)\s+(?:undisputed\s+)?(?:amounts?|dues|arrears)\b", before, re.I))
++                if dn and not re.search(r"\bexcept\b|[.:;]\s*\n\s*\n", before[dn[-1].end():]):
++                    neg = dn[-1]
++            if neg:
++                exc = _P17_EXCEPT.search(sent)
++                if not exc:
++                    continue                               # a plain denial
++                tail = sent[exc.end():]
++                if _P17_NIL_AFTER.search(tail.lstrip(" :;-,")) or (not tail.strip(" :;-,.") and _P17_NIL_AFTER.search(after.lstrip(" :;-,\n"))):
++                    continue                               # "except as below: Nil"
++            elif _P17_FOLLOWS.search(sent) and _P17_NIL_AFTER.search(after.lstrip(" :;-,\n")):
++                continue                                   # "are as follows: Nil"
++            if _DISPUTE_TABLE_RE.search(after[:400]) and (_P17_FOLLOWS.search(sent) or _P17_EXCEPT.search(sent)
++                                                         or re.search(r"\bbelow\b", sent, re.I)):
++                continue                                   # the listed table is a disputed-dues table
++            return sent[:240]
++        return None
++
++
++R_ARREARS_LISTED = _ListedArrearsRule("ADV_STATUTORY_ARREARS_LISTED", r"x",
++                                      description="Undisputed statutory dues outstanding for more than six months "
++                                                  "(listed by the auditor; no amount needed - D14 / P17)")
++R_ARREARS_LISTED.staged_patch = "P17_ADV"
++
+ ADVERSE_TRIGGERS = {
+     2020: {
+         "i_c": [R_TITLE], "i": [R_TITLE],
+         "iv": [R_185],
+-        "vii_a": [R_ARREARS, R_ARREARS_EXCEPT], "vii_b": [R_DISPUTED],
+-        "vii": [R_ARREARS, R_ARREARS_EXCEPT, R_DISPUTED],
++        "vii_a": [R_ARREARS, R_ARREARS_EXCEPT, R_ARREARS_LISTED], "vii_b": [R_DISPUTED],
++        "vii": [R_ARREARS, R_ARREARS_EXCEPT, R_DISPUTED, R_ARREARS_LISTED],
+         "ix_a": [R_DEFAULT], "ix_b": [R_WILFUL], "ix_c": [R_PURPOSE], "ix_d": [R_ST_LT],
+         "ix": [R_DEFAULT, R_WILFUL, R_PURPOSE, R_ST_LT],
+         "xi_a": [R_FRAUD], "xi": [R_FRAUD],
+@@ -752,8 +815,8 @@
+     2016: {
+         "i_c": [R_TITLE], "i": [R_TITLE],
+         "iv": [R_185],
+-        "vii_a": [R_ARREARS, R_ARREARS_EXCEPT], "vii_b": [R_DISPUTED],
+-        "vii": [R_ARREARS, R_ARREARS_EXCEPT, R_DISPUTED],
++        "vii_a": [R_ARREARS, R_ARREARS_EXCEPT, R_ARREARS_LISTED], "vii_b": [R_DISPUTED],
++        "vii": [R_ARREARS, R_ARREARS_EXCEPT, R_DISPUTED, R_ARREARS_LISTED],
+         "viii": [R_DEFAULT, R_WILFUL],
+         "ix": [R_PURPOSE],
+         "x": [R_FRAUD],
+@@ -960,6 +1023,15 @@
+                             break
+                     if hit:
+                         break
++            if hit is None and uid == "vii_a" and rec.get("_staged") and _patch_on("P17_ADV") and level == "sub":
++                # P17: the arrears list printed under another letter of the same clause (Committed Ispat 2022-23:
++                # "(b) ... there were following amounts payable ... in arrears ... more than six months" + table)
++                mnf = r.get("normalized_fields") if isinstance(r.get("normalized_fields"), dict) else {}
++                mtxt = strip_labels(real_text(mnf.get("source_text")) or "")
++                if mtxt:
++                    sent = R_ARREARS_LISTED.hit(mtxt)
++                    if sent:
++                        hit = (R_ARREARS_LISTED, sent, True)
+             if hit is None and uid == "xvii" and rec.get("_staged") and _patch_on("F33"):          # PATCH 13-Oct-2026 (F33)
+                 sent = cash_loss_with_amount(text)
+                 if sent:
+--- /tmp/claude-0/-home-claude/917aa1f3-a274-51e1-b8f0-b7e625621980/scratchpad/pkg_v5/tests/run_phase2_cases.py	2026-10-14 07:20:07.758216216 +0000
++++ tests/run_phase2_cases.py	2026-10-14 11:46:37.277998484 +0000
+@@ -47,7 +47,10 @@
+ # it runs with them ON and checks the shipped values separately (test V5-0).
+ _SHIPPED = dict(st.PATCH_SWITCHES)
+ _V5_FROZEN = ("AMT_PROMPT", "XWALK_LAYOUT", "SUBJ_2016", "ONE_UNIT", "P2_PROMPT", "P4", "P15", "P18", "P7B")
+-for _k in _V5_FROZEN:
++# v6 (14-Oct trial): every recheck note added after the 13-Oct run is OFF in the shipped code (they change the
++# recheck request); the tests still run them ON so each note stays tested for a later live trial
++_V6_FROZEN = ("F35", "P1", "P2_NOTE", "P6", "P7C", "P7D", "P7E", "P8", "P13", "P16", "GUARD_INCOMPLETE_NOTE")
++for _k in _V5_FROZEN + _V6_FROZEN:
+     st.PATCH_SWITCHES[_k] = True
+ from caro import post_rules as pr, mca_table as MT, audit, perf, result_cache          # noqa: E402
+ 
+@@ -2530,10 +2533,13 @@
+       st._GUESS_WORDS.search("the funds were utilized for the stated purpose, indicating compliance")
+       and not st._GUESS_WORDS.search("nothing has come to the auditor's attention indicating material uncertainty"))
+ 
+-check("V5-0 shipped config: the 13-Oct prompts (AMT_PROMPT, XWALK_LAYOUT, SUBJ_2016, ONE_UNIT, P2_PROMPT, P4, P15, "
+-      "P18 off) and P7B off; the code fixes (P2 table, P8, P7C, F35, P13, NA_PUSH_V5, amounts) on",
+-      all(_SHIPPED.get(k) is False for k in _V5_FROZEN) and all(_SHIPPED.get(k) is True for k in
+-          ("P2", "P8", "P7C", "P7E", "F35", "P13", "P1", "P16", "P7A", "NA_PUSH_V5", "GUARD_INCOMPLETE", "SCOPE_OWN")))
++check("V6-0 shipped config: the 13-Oct prompts (AMT_PROMPT, XWALK_LAYOUT, SUBJ_2016, ONE_UNIT, P2_PROMPT, P4, P15, "
++      "P18 off), P7B off, every post-13-Oct recheck note off (F35, P1, P2_NOTE, P6, P7C, P7D, P7E, P8, P13, P16, "
++      "GUARD_INCOMPLETE_NOTE); the code fixes (P2 table, P7A, P11, F34, NA_PUSH_V5, GUARD_INCOMPLETE final guard, "
++      "SCOPE_OWN, RECHECK_GUARD, amounts) on",
++      all(_SHIPPED.get(k) is False for k in _V5_FROZEN + _V6_FROZEN) and all(_SHIPPED.get(k) is True for k in
++          ("P2", "P7A", "P11", "F34", "NA_PUSH_V5", "GUARD_INCOMPLETE", "SCOPE_OWN", "RECHECK_GUARD"))
++      and st.RECHECK_MAX_TOKENS == 12000)
+ check("V5-1 (14-Oct run, Viraj Canes (xix) x4) P8: 'the going concern assumption' is the auditor's own term, never a "
+       "guess; 'implying', 'we assume', 'based on the assumption that' still are",
+       not st._GUESS_WORDS.search("the going concern assumption is going to continue")
+@@ -2573,6 +2579,87 @@
+       "denial still is", not _PRm.na_covers(_mA, "iii_a_A", 2023) and not _PRm.na_covers(_mS, "iii_a_B", 2024)
+       and _PRm.na_covers(_mN, "iii_a_A", 2023))
+ 
++# ---- v6 (14-Oct trial) -----------------------------------------------------------------------------------------
++class _RecheckTimeout(GoldModel):
++    """Siddhivinayak 2024-25: the recheck request timed out after 600 s and the whole filing was lost."""
++    def __init__(self, *a, **k):
++        super().__init__(*a, **k)
++        self.max_tokens, self.recheck_cap = 30000, None
++    def chat(self, system, user, schema=None):
++        if system.startswith(CALL2) and '"recheck":' in user:
++            self.recheck_cap = self.max_tokens
++            raise TimeoutError("timed out")
++        return super().chat(system, user, schema)
++_gt = _RecheckTimeout(_ctj.replace("\t", "    "), by_number=True)
++_rt, _nt, _rr, _ = run_filing("jsons_2020", _gt, "staged_nofallback")
++_n2t = (_nt.get("staged") or {}).get("call2") or {}
++check("V6-1 (14-Oct trial, Siddhivinayak 2024-25) a timeout in the recheck keeps the first Call 2 answers (no failed "
++      "filing, no fallback); the recheck reply is capped at 12,000 tokens and the client's budget is restored",
++      _gt.recheck_cap == 12000 and _gt.max_tokens == 30000 and not _nt.get("stage_fallback")
++      and "TimeoutError" in str(_n2t.get("recheck_failed") or _nt) and len(flat(_rt)) > 30,
++      (_gt.recheck_cap, _gt.max_tokens, _nt.get("stage_fallback"), str(_n2t.get("recheck_failed"))[:80]))
++from caro import amounts as _AM                                                              # noqa: E402
++check("V6-2 (Toby 14-Oct) only numeric units scale a figure: '(Rs. in hundreds)' x100, \"(Rs. in '000)\" / '(₹ ’000)' "
++      "x1,000, lakh / crore / thousand / million as before; 'rupees five hundred crore' (no digits) and land / period "
++      "words are never a heading",
++      _AM.unit_heading("(Rs. in hundreds)") == 100 and _AM.unit_heading("(Rs. in '000)") == 1000
++      and _AM.unit_heading("(₹ ’000)") == 1000 and _AM.unit_heading("Amount in Rs. '000") == 1000
++      and _AM.unit_heading("(Rs. in Lakhs)") == 1e5 and _AM.unit_heading("(Rs. in Crore)") == 1e7
++      and _AM.unit_heading("Amount (Rs.) Thousand") == 1e3 and _AM.unit_heading("(₹ in Million)") == 1e6
++      and _AM.unit_heading("net worth of rupees five hundred crore or more") == 1.0
++      and _AM.unit_heading("110 acre – 13 Ghunte") == 1.0 and _AM.to_rupees("Rs. 5 hundred") == 500
++      and _AM.to_rupees("Rs. 1,00,000") == 100000 and _AM.to_rupees("1,250", 1e3) == 1250000)
++def _amt(uid, text, items):
++    rec = {"staged_trace": {}, "classification": "qualified", "evidence_text": text[:80],
++           "normalized_fields": {"amount_items": [{"as_printed": p, "counts_toward_total": True, "note": ""} for p in items]}}
++    return _AM.compute(rec, uid, text, text, 2020).get("amount_total")
++check("V6-3 (Toby 14-Oct) a land area (acre, bigha, guntha, kanal, marla, cents, hectare, sq. ft) or a count / rate / "
++      "period (shares, numbers, %, days) is never rupees even when the model counts it; the money figure beside it is",
++      _amt("i_c", "(c) Title deeds of land measuring 12 kanal at Ludhiana are not in the name of the Company.", ["12"]) is None
++      and _amt("i_c", "(c) Title deeds of land of 18 marla at Amritsar are not in the name of the Company.", ["18"]) is None
++      and _amt("i_c", "(c) Title deeds of 45 cents of land at Kochi are not in the name of the Company.", ["45"]) is None
++      and _amt("i_c", "(c) Title deeds of 25 bigha of land at Jaipur are not held in the name of the Company.", ["25"]) is None
++      and _amt("i_c", "(c) Title deeds of land of 13 guntha, gross carrying value Rs. 361.75 lacs, are not in the name "
++               "of the Company.", ["13", "361.75"]) == 36175000
++      and _amt("x_b", "(b) The Company has made a preferential allotment of 1,50,000 equity shares during the year.",
++               ["1,50,000"]) is None
++      and _amt("iii_d", "(d) The amount of Rs. 12,50,000 is overdue for more than 90 days.", ["12,50,000", "90"]) == 1250000
++      and _amt("vii_a", "(a) Undisputed dues of Rs. 4,520 hundred were outstanding for more than six months.",
++               ["4,520"]) == 452000
++      and _amt("vii_a", "(a) Undisputed dues outstanding for more than six months:\nName of statute (Rs. in '000)\n"
++               "Income Tax 4,520\nGST 1,200", ["4,520", "1,200"]) == 5720000
++      # replay guard (Starlite 2021-22 (iii)(f)): a word on the NEXT line ("Percentage of loan") is not the figure's unit
++      and _amt("iii_f", "(f) the Company has given loans repayable on demand to the following Company:\n\nParticulars"
++               "\n\nAmount\n\nStarlite Global Enterprises FZE, UAE\n\n1,23,21,685\n\nPercentage of loan to total "
++               "loans\n\n100%", ["1,23,21,685"]) == 12321685)
++
++_LA = pr.R_ARREARS_LISTED
++check("V6-4 (P17, Toby 14-Oct: arrears > 6 months = Adverse; D14: no amount needed) undisputed arrears the auditor LISTS "
++      "fire the Adverse trigger - 'no undisputed amounts ... except following ... were in arrears ... more than six "
++      "months' (Ichalkaranji), '... outstanding ... more than six months ... are as follows' (Aditya), 'there were "
++      "following amounts ... in arrears' (Committed Ispat); never a plain denial, 'except as given below: Nil', a "
++      "disputed-dues table, the Order's own question wording, or a denial cut by a stray full stop (Viraj Canes 2023-24)",
++      _LA.hit("According to the information and explanations given to us, no undisputed amounts payable except following "
++              "in respect of the above were in arrears as at March 31, 2022 for a period of more than six months from the "
++              "date on when they become payable.")
++      and _LA.hit("undisputed dues in respect of taxes deducted at source, which were outstanding, at the year end, for a "
++                  "period of more than six months from the date they became payable, are as follows: Name of the statute")
++      and _LA.hit("b) there were following amounts payable in respect thereof were in arrears as at the last day of the "
++                  "financial year for a period of more than six months from the date they become payable.")
++      and not _LA.hit("no undisputed amounts payable in respect of these statutory dues were outstanding, at the year end, "
++                      "for a period of more than six months from the date they became payable.")
++      and not _LA.hit("There are no undisputed amounts payable which were in arrears for more than six months except as "
++                      "given below: Nil")
++      and not _LA.hit("There were no undisputed amounts outstanding for more than six months except as stated below.\n"
++                      "Name of statute Forum where dispute is pending Appellate")
++      and not _LA.hit("The extent of the arrears of statutory dues outstanding as at March 31, 2024, for a period of more "
++                      "than six months from the date they became payable.")
++      and not _LA.hit("There were no undisputed amounts payable in respect of Provident Fund, Employees'\n\nState "
++                      "Insurance, Income Tax, Sales Tax, Service Tax, Value Added Tax, Goods and\n\nService Tax. Customs "
++                      "Duty, Excise Duty, Cess and other material statutory dues in\n\narrears as at March 31, 2024 for "
++                      "a period of more than six months from the date they\n\nbecame payable.")
++      and _LA.staged_patch == "P17_ADV" and _SHIPPED.get("P17_ADV") is True)
++
+ urllib.request.urlopen = _real_urlopen
+ n_ok = sum(ok for _n, ok in RESULTS)
+ print(f"\n{n_ok}/{len(RESULTS)} Phase 2 checks passed")

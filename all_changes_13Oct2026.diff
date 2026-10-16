@@ -1,0 +1,2305 @@
+--- a/caro/amounts.py
++++ b/caro/amounts.py
+@@ -673,6 +673,657 @@
+     return out
+ 
+ 
++
++# ---------------------------------------------------------------------------
++# PATCH 13-Oct-2026 (Phase 2, amounts) -- checks on the model's figures, two-call records only.
++# amount no longer depends on which cells of a table the model happened to copy.
++#
++# WHY (13-Oct run, CA review of every one of the 162 amounts; 34 wrong):
++#   * a "deposited under protest" column added to the disputed dues (Aditya 2020-21 (vii)(b));
++#   * a previous-year column picked where this year's cell is 0.00 (Western 2020-21 (v));
++#   * opening balance / amount given during the year added to the year-end balance (Garden Court
++#     2024-25 (iii)(a)(A), Western 2023-24 (iii), K.R. Foods 2020-21 (iii)(b), Ichalkaranji (v));
++#   * a loan balance shown as the default amount (Viraj Canes (ix)(a), 5 years);
++#   * the Rs 5 crore limit of (ii)(b) shown as an amount (Refit 2023-24);
++#   * "110 acre" counted as Rs 110 (Shri Dutt (i)(c));
++#   * interest that is already inside the outstanding figure added again (Ichalkaranji (ix)(a));
++#   * undisputed arrears added to the disputed dues (Apollo 2020-21 (vii)(b));
++#   * (iii)(a) table rows put on the wrong slot (WickedRide, 4 years) and a guarantee added to a loan
++#     (Shri Dutt 2023-24 (iii)(a)(B)) - the approved rule LOAN VS. GUARANTEE says the funded loan
++#     balance is the amount and a guarantee is never added to it;
++#   * (ii)(b) quarterly differences added together or not read at all.
++#
++# Every check here only REMOVES a figure that cannot count, ADDS a row of the same table column the
++# model already used, or reads a table the auditor printed for (iii)(a) / (ii)(b). No label is ever
++# set. All checks run only on two-call records (record carries "staged_trace"); the single flow is
++# untouched. Each check can be switched off in AMOUNT_SWITCHES (rollback without a code change).
++# ---------------------------------------------------------------------------
++AMOUNT_SWITCHES = {
++    "TABLE_COLUMNS": True,   # paid / opening / previous-year / flow columns never count; closing column of loan tables
++    "ROW_COMPLETE": True,    # rows of the same table column the model left out (loan / deposit tables)
++    "III_A_TABLE": True,     # (iii)(a)(A)/(B) amounts read from the auditor's table by row label
++    "II_B_DIFF": True,       # (ii)(b): the difference, year-end quarter (else the largest); never a sum
++    "NOT_MONEY": True,       # areas, the Rs 5 crore limit of (ii)(b)
++    "BALANCE_NOT_DEFAULT": True,  # (ix)(a) / CARO 2016 (viii): a loan balance is not a default amount
++    "UNDISPUTED_IN_VII_B": True,  # undisputed arrears never count under (vii)(b); move to (vii)(a)
++    "INTEREST_TEXT": True,   # "outstanding ... including interest" also on the text-reading path
++    "UNIT_CARRY": True,      # "Rs.1009 thousand and ... Rs.9563": the bare figure takes the unit
++    "OPENING_PROSE": True,   # "outstanding at the beginning of the year was ..." never counts
++    "FAV_NO_AMOUNT": True,   # a Favourable unit carries an amount only for exposure units
++    "SIBLING_DUP": True,     # one printed figure on one sub-clause only ((xx)(a)/(b), (iii)(a)(A)/(B))
++    "EVIDENCE_SHOWS_AMOUNT": False, # source_text gets the table row / sentence of a counted figure (off: needs placement fix first)
++    "OWN_CLAUSE_ONLY": True,  # a figure must be printed in this clause's own passage (not another clause's)
++}
++
++
++def amt_switch_on(key: str) -> bool:
++    return bool(AMOUNT_SWITCHES.get(key, False))
++
++
++def is_staged(rec: dict) -> bool:
++    return isinstance(rec, dict) and rec.get("staged_trace") is not None
++
++
++# ---------------------------------------------------------------------------
++# units
++# ---------------------------------------------------------------------------
++LOANISH = {2020: {"iii", "iii_a", "iii_a_a", "iii_a_b", "iii_b", "iii_c", "iii_d", "iii_e", "iii_f", "v"},
++           2016: {"iii", "iii_a", "iii_b", "iii_c", "v"}}
++# Favourable units whose amount is an exposure worth showing (loans / guarantees given, deposits)
++EXPOSURE = {2020: {"iii", "iii_a_a", "iii_a_b", "iii_f", "iv", "v"},
++            2016: {"iii", "iii_a", "iv", "v"}}
++DEFAULT_UNITS = {2020: {"ix_a"}, 2016: {"viii"}}
++
++# ---------------------------------------------------------------------------
++# table reader (the CARO text keeps one table cell per line; a few lines hold two figures)
++# ---------------------------------------------------------------------------
++_NUMTOK = re.compile(r"(?:(?:rs\.?|₹|inr|\?)\s*)?(\d[\d,]*(?:\.\d+)?)\s*(?:/-)?\s*(?:\(\s*(?:dr|cr)\.?\s*\))?", re.I)
++_EMPTY_CELL = re.compile(r"^\s*(?:-+|–|—|nil|n\.?a\.?|none)\s*$", re.I)
++_MAINMARK = re.compile(r"(?m)^[ \t]*\(?\s*[ivx]{1,5}\s*[.)][ \t]|\[MCA_BOX:")
++_SUBMARK = re.compile(r"(?m)^[ \t]*\(?\s*[a-h]\s*\)[ \t]?\S|^[ \t]*\(?\s*[ivx]{1,5}\s*\)\s*\(\s*[a-h]\s*\)")
++_INTRO = re.compile(r"as follows|as under|here\s*under|given below|mentioned below|details below|[:]\s*$", re.I)
++_UNIT_LINE = re.compile(r"^\s*\(?\s*(?:amount\s*)?(?:\(?\s*(?:rs\.?|₹|inr|rupees)\s*\)?\s*)?(?:in\s+)?"
++                        r"(?:rupees\s+)?(?:crores?|lakhs?|lacs?|thousands?|rs\.?|₹|inr)?\s*\)?\s*$", re.I)
++_DATE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]((?:19|20)\d\d)\b|\b31(?:st)?\s*(?:march|mar\.?),?\s*((?:19|20)\d\d)\b", re.I)
++_MONEYCOL = re.compile(r"amount|balance|disput|protest|deposit|paid|given|granted|during the year|opening|closing"
++                       r"|outstanding|guarantee|loan|advance|investment|security|difference|value as per|\bin\s+rs\b|\(\s*in\s+rs", re.I)
++_NOT_AMOUNT_COL = re.compile(r"^\s*(?:period|forum|nature of|name of|statute|particulars|pan\b|quarter|due date|date of"
++                             r"|s\.?\s*no|sr\.?\s*no|reason|remarks?)", re.I)
++_SLOT_A = re.compile(r"subsidiar|joint\s*venture|\bjvs?\b|associate(?!d)(?!\s+concern)", re.I)
++_SLOT_B = re.compile(r"\bothers?\b|employees?|any other part|other than", re.I)
++_GROUP_FLOW = re.compile(r"aggregate amount|during the year|granted|provided during", re.I)
++_GROUP_STOCK = re.compile(r"balance outstanding|outstanding as at|balance as at|closing balance", re.I)
++
++
++def _col_kind(h: str) -> str:
++    s = h.lower()
++    if re.search(r"protest|deposited|\bpaid\b|pre-?deposit", s):
++        return "paid"
++    if re.search(r"opening|beginning|brought forward", s):
++        return "opening"
++    if "difference" in s:
++        return "difference"
++    if re.search(r"as per books|books of account", s):
++        return "books"
++    if re.search(r"statement|returns?\b|lenders|bank", s) and "value" in s:
++        return "statement"
++    if "guarantee" in s or re.search(r"\bsecurity\b", s):
++        return "guarantee"
++    if re.search(r"during the year|given|granted|aggregate amount", s) and not re.search(r"closing|balance|outstanding", s):
++        return "flow"
++    if re.search(r"closing|balance|outstanding", s):
++        return "stock"
++    if re.search(r"\bloans?\b|advance", s):
++        return "loan"
++    return "main"
++
++
++def _lines(text: str, start: int, end: int):
++    """[(abs_start, abs_end, stripped line)] for non-empty lines."""
++    out = []
++    pos = start
++    for raw in text[start:end].split("\n"):
++        s = raw.strip()
++        if s:
++            out.append((pos, pos + len(raw), s))
++        pos += len(raw) + 1
++    return out
++
++
++def _cells_of(line: str, abs_start: int):
++    """Cells of a line made only of figures / '-' (None when the line has words)."""
++    if _EMPTY_CELL.match(line):
++        return [("-", abs_start, None)]
++    rest = re.sub(r"\(\s*(?:dr|cr)\.?\s*\)", "", line, flags=re.I)
++    rest = re.sub(r"(?:rs\.?|₹|inr|/-|\?)", "", rest, flags=re.I)
++    if re.search(r"[A-Za-z]", rest):
++        return None
++    toks = list(_NUMTOK.finditer(line))
++    if not toks:
++        return None
++    # a lone integer below 1,000 with no comma / decimal is a serial number, not a cell
++    if len(toks) == 1:
++        n = toks[0].group(1)
++        if "," not in n and "." not in n and len(n) <= 3:
++            return None
++        if re.fullmatch(r"(?:19|20)\d\d", n):
++            return None
++    # every character must be a figure, '-', space or marker
++    left = _NUMTOK.sub("", line)
++    left = re.sub(r"[\s\-–—]+", "", left)
++    if left:
++        return None
++    out = []
++    for m in toks:
++        out.append((m.group(0).strip(), abs_start + m.start(1), m.group(1)))
++    return out
++
++
++def _region(text: str, pos: int):
++    """Start / end of the table region around pos: no further back than the clause (or sub-clause)
++    marker before pos, no further on than the next marker / running sentence."""
++    start = max(0, pos - 4000)
++    for m in _MAINMARK.finditer(text, start, pos):
++        start = m.start()
++    end = len(text)
++    nxt = _MAINMARK.search(text, pos + 1)
++    if nxt:
++        end = nxt.start()
++    return start, min(end, pos + 8000)
++
++
++def _header_and_rows(text: str, pos: int):
++    """Read the table that holds pos. Returns dict(header=[...], kinds=[...], rows=[...], intro=str,
++    slot_table=bool, lines=[...]) or None."""
++    start, end = _region(text, pos)
++    lines = _lines(text, start, end)
++    if not lines:
++        return None
++    idx = next((i for i, (a, b, _) in enumerate(lines) if a <= pos <= b), None)
++    if idx is None:
++        return None
++    if _cells_of(lines[idx][2], lines[idx][0]) is None:
++        return None
++    # walk back to the start of the table: the introducing sentence
++    j = idx
++    first_cell = None
++    while j >= 0:
++        s = lines[j][2]
++        words = len(re.findall(r"[A-Za-z]{2,}", s))
++        cells = _cells_of(s, lines[j][0])
++        if cells is not None:
++            first_cell = j
++        elif words >= 10 or (words >= 4 and _INTRO.search(s)):
++            break
++        j -= 1
++    intro = lines[j][2] if j >= 0 else ""
++    hdr_start = j + 1
++    if first_cell is None:
++        return None
++    # the table ends at the first running sentence after pos
++    k = idx
++    while k + 1 < len(lines):
++        s = lines[k + 1][2]
++        if _cells_of(s, lines[k + 1][0]) is None and len(re.findall(r"[A-Za-z]{2,}", s)) >= 10:
++            break
++        k += 1
++    body = lines[hdr_start:k + 1]
++    # header = label lines before the first cell line
++    pre = []
++    for a, b, s in body:
++        if _cells_of(s, a) is not None:
++            break
++        pre.append(s)
++    slot_table = False
++    header = []
++    for s in pre:
++        if (_GROUP_FLOW.search(s) or _GROUP_STOCK.search(s)) and len(re.findall(r"[A-Za-z]{2,}", s)) >= 4 \
++                and not re.search(r"closing|opening|\(\s*in\s+rs|31[./]|value as per|amount of", s, re.I):
++            slot_table = True                      # a row-group label ("Balance outstanding as at ..."), not a column
++            break
++        if (_SLOT_A.search(s) or _SLOT_B.search(s)) and len(re.findall(r"[A-Za-z]{2,}", s)) <= 6:
++            slot_table = True                      # a row label ("- Subsidiaries"), not a column
++            break
++        if re.fullmatch(r"\(?\s*(?:rs\.?|₹|inr)\s*\.?\s*\)?", s, re.I) or _UNIT_LINE.match(s) and len(s) < 30 \
++                and not re.match(r"amount\b", s, re.I) \
++                and not re.search(r"[A-Za-z]{4,}", re.sub(r"(?i)crores?|lakhs?|lacs?|thousands?|amount|rupees", "", s)):
++            if header and len(s) < 12:
++                header[-1] += " " + s              # "(Rs.)" under "Amount Disputed"
++            continue
++        if header and s.lower() in ("balance", "balances", "amount", "(rs)", "(rs.)") :
++            header[-1] += " " + s                  # "Closing" / "Balance" on two lines
++            continue
++        header.append(s)
++    money = [h for h in header if _MONEYCOL.search(h) and not _NOT_AMOUNT_COL.search(h)]
++    kinds = [_col_kind(h) for h in money]
++    # dates decide current / previous between columns of the same kind
++    years = []
++    for h in money:
++        m = _DATE.search(h)
++        years.append(int(m.group(1) or m.group(2)) if m else None)
++    if sum(1 for y in years if y) >= 2:
++        latest = max(y for y in years if y)
++        kinds = [("prior" if (y and y < latest) else k) for k, y in zip(kinds, years)]
++    # rows: label lines then a run of cells
++    rows, cur_label, run = [], [], []
++    for a, b, s in body[len(pre):]:
++        cells = _cells_of(s, a)
++        if cells is None:
++            if run:
++                rows.append({"label": " ".join(cur_label), "cells": run})
++                cur_label, run = [], []
++            cur_label.append(s)
++        else:
++            run.extend(cells)
++    if run:
++        rows.append({"label": " ".join(cur_label), "cells": run})
++    return {"header": money, "kinds": kinds, "rows": rows, "intro": intro, "pre": pre,
++            "slot_table": slot_table, "start": lines[hdr_start][0] if hdr_start < len(lines) else start}
++
++
++def cell_kind(text: str, pos: int) -> Optional[str]:
++    """Kind of the table column the figure at pos sits in, or None when the table cannot be read
++    safely. Kinds: paid, opening, prior, flow, stock, guarantee, loan, difference, books, statement,
++    main, closing_last / not_last (closing column is the last one and the row has more cells)."""
++    t = _header_and_rows(text, pos)
++    if not t or t["slot_table"] or len(t["header"]) < 2:
++        return None
++    for r in t["rows"]:
++        for i, c in enumerate(r["cells"]):
++            if c[2] and c[1] <= pos < c[1] + len(c[2]):
++                n = len(r["cells"])
++                if n == len(t["kinds"]):
++                    return t["kinds"][i]
++                if t["kinds"][-1] in ("stock",) and n > len(t["kinds"]):
++                    return "stock" if i == n - 1 else "not_last"
++                return None
++    return None
++
++
++def table_column_cells(text: str, pos: int):
++    """All cells (printed, position) of the column the figure at pos sits in, when every row has the
++    same number of cells as the header has amount columns; None otherwise."""
++    t = _header_and_rows(text, pos)
++    if not t or t["slot_table"] or len(t["header"]) < 2:
++        return None
++    n = len(t["kinds"])
++    if any(len(r["cells"]) != n for r in t["rows"]):
++        return None
++    col = None
++    for r in t["rows"]:
++        for i, c in enumerate(r["cells"]):
++            if c[2] and c[1] == pos:
++                col = i
++    if col is None:
++        return None
++    return [(r["cells"][col][0], r["cells"][col][1], r["label"]) for r in t["rows"] if r["cells"][col][2]]
++
++
++# ---------------------------------------------------------------------------
++# (iii)(a) table by row label
++# ---------------------------------------------------------------------------
++def _num(s: str) -> Optional[float]:
++    m = re.search(r"\d[\d,]*(?:\.\d+)?", s or "")
++    if not m:
++        return None
++    try:
++        return float(m.group(0).replace(",", ""))
++    except ValueError:
++        return None
++
++
++def iii_a_slot_figures(window: str, slot: str):
++    """(iii)(a) amounts table read by row label. slot 'A' (subsidiaries / JV / associates) or 'B'
++    (others). Returns (list of printed cells that count, note) or None when no such table is found or
++    it cannot be read safely. Balance outstanding row only (FLOW VS. STOCK); funded loans / advances
++    when printed, guarantees only when no loan is printed (LOAN VS. GUARANTEE)."""
++    if not window:
++        return None
++    lines = _lines(window, 0, len(window))
++    # find a header: two or more amount-kind column names among Guarantees / Loans / Advances / Security
++    hdr_idx = [i for i, (_, _, s) in enumerate(lines)
++               if re.fullmatch(r"(?:-\s*)?(?:corporate\s+)?(?:guarantees?|loans?|advances?(?: in (?:the )?nature of loans?)?|security|securities"
++                               r"|investments?)\.?", s, re.I)]
++    if len(hdr_idx) < 2:
++        return None
++    first = hdr_idx[0]
++    # the columns must be consecutive lines (a header block)
++    cols = []
++    for i in range(first, len(lines)):
++        s = lines[i][2]
++        if i in hdr_idx:
++            cols.append("guarantee" if re.search(r"guarantee|security", s, re.I) else "loan")
++        elif re.fullmatch(r"particulars", s, re.I) or _UNIT_LINE.match(s) and len(s) < 30:
++            continue
++        else:
++            break
++    if len(cols) < 2:
++        return None
++    nc = len(cols)
++    intro = " ".join(s for _, _, s in lines[max(0, first - 3):first])
++    # tokens after the header
++    toks = []
++    for a, b, s in lines[first + len(cols):]:
++        cells = _cells_of(s, a)
++        if cells is not None:
++            toks.extend(("C", c) for c in cells)
++            continue
++        words = len(re.findall(r"[A-Za-z]{2,}", s))
++        if _GROUP_STOCK.search(s) or re.search(r"\bbalance\b", s, re.I):
++            toks.append(("G", "stock"))
++        elif _GROUP_FLOW.search(s):
++            toks.append(("G", "flow"))
++        elif _SLOT_A.search(s) and words <= 6:
++            toks.append(("L", "A"))
++        elif _SLOT_B.search(s) and words <= 6:
++            toks.append(("L", "B"))
++        elif words >= 10:
++            break                                  # running sentence: end of table
++        else:
++            continue                               # "of above", "in respect" ...
++    # the balance-outstanding group
++    try:
++        g = max(i for i, t in enumerate(toks) if t == ("G", "stock"))
++    except ValueError:
++        return None
++    seg = []
++    for t in toks[g + 1:]:
++        if t[0] == "G":
++            break
++        seg.append(t)
++    # the cells printed between the group label and its first slot label belong to the group too
++    labels = [t[1] for t in seg if t[0] == "L"]
++    blocks, cur = [], []
++    order = []                                     # sequence of 'L:x' / 'B:i'
++    for t in seg:
++        if t[0] == "C":
++            cur.append(t[1])
++        else:
++            if cur:
++                blocks.append(cur)
++                order.append(("B", len(blocks) - 1))
++                cur = []
++            order.append(("L", t[1]))
++    if cur:
++        blocks.append(cur)
++        order.append(("B", len(blocks) - 1))
++    rows = {}
++    if not labels:
++        # a table for one slot only ("given to parties other than subsidiaries ...")
++        want = "B" if re.search(r"other than|others|any other", intro, re.I) else (
++            "A" if _SLOT_A.search(intro) else None)
++        if want is None or want != slot or len(blocks) != 1 or len(blocks[0]) != nc:
++            return None
++        rows[slot] = blocks[0]
++    elif len(blocks) == 1 and len(blocks[0]) == nc * len(labels) and order[0][0] == "L" \
++            and all(o[0] == "L" for o in order[:len(labels)]):
++        for k, lab in enumerate(labels):            # labels first, then the cells row by row
++            rows[lab] = blocks[0][k * nc:(k + 1) * nc]
++    elif len(blocks) == len(labels):
++        for lab, blk in zip(labels, blocks):        # one block per label, in order
++            rows[lab] = blk
++    else:
++        last = None
++        for o in order:                             # each block to the label printed before it
++            if o[0] == "L":
++                last = o[1]
++            elif last is not None:
++                rows[last] = blocks[o[1]]
++            else:
++                return None
++    if slot not in rows and labels and slot in labels:
++        return [], "iii_a_table: no figure on this row"
++    if slot not in rows:
++        return None
++    cells = rows[slot]
++    if len(cells) != nc:
++        return None
++    loans = [c[0] for c, k in zip(cells, cols) if k == "loan" and c[2] and (_num(c[0]) or 0) > 0]
++    guar = [c[0] for c, k in zip(cells, cols) if k == "guarantee" and c[2] and (_num(c[0]) or 0) > 0]
++    if loans:
++        return loans, "iii_a_table: balance outstanding, funded loans" + (" (guarantee not added)" if guar else "")
++    if guar:
++        return guar, "iii_a_table: balance outstanding, guarantees (no loan printed)"
++    return [], "iii_a_table: no figure on this row"
++
++
++# ---------------------------------------------------------------------------
++# (ii)(b) differences
++# ---------------------------------------------------------------------------
++def ii_b_difference(text: str, positions: list):
++    """The difference the auditor prints between the books and the quarterly statements. Returns
++    (printed, note) or None. Table with a 'difference' column: the year-end (March) quarter, else the
++    largest. Prose: 'a difference of Rs. X' wins; else two balances (books vs statement) -> their
++    difference is left to the caller (None here)."""
++    for p in positions:
++        if p is None or p < 0:
++            continue
++        t = _header_and_rows(text, p)
++        if not t or "difference" not in t["kinds"]:
++            continue
++        di = t["kinds"].index("difference")
++        best, pick = None, None
++        for r in t["rows"]:
++            if len(r["cells"]) != len(t["kinds"]) or not r["cells"][di][2]:
++                continue
++            c = r["cells"][di]
++            if re.search(r"\bmar(?:ch)?\b", r["label"], re.I):
++                return c[0], c[1], "ii_b: difference of the year-end quarter"
++            v = _num(c[0]) or 0
++            if best is None or v > best:
++                best, pick = v, c
++        if pick:
++            return pick[0], pick[1], "ii_b: largest quarterly difference (no year-end row)"
++    return None
++
++
++# ---- figure checks used by compute() / apply_amounts() ----------------------
++
++_THRESHOLD_BEFORE = re.compile(r"(?:in\s+excess\s+of|exceed\w*|more\s+than|above)\s*(?:rs\.?|₹|inr|\?)?\s*\.?\s*$", re.I)
++_OPENING_WORDS = re.compile(r"beginning of the (?:year|period|financial year)|opening balance|brought forward", re.I)
++_YEAR_END_WORDS = re.compile(r"year[\s-]*end|closing|as at|as on|balance sheet date|outstanding at the end|continue to remain", re.I)
++_BALANCE_BEFORE = re.compile(r"\bbalances?\b|\boutstanding (?:balance|as on)\b", re.I)
++_DEFAULT_WORDS = re.compile(r"overdue|not paid|unpaid|default(?:ed)?\s+(?:of|amount|in\s+(?:the\s+)?(?:re)?payment\s+of\s+(?:rs|₹))"
++                            r"|\bnpa\b|non[- ]performing|delay|amount not paid", re.I)
++_UNDISPUTED_SENT = re.compile(r"\bundisputed\b|in arrears\b[^.]{0,120}six months|for a period of more than six months", re.I)
++_DISPUTE_SENT = re.compile(r"(?<!un)disput|\bforum\b|pending before|appellate|tribunal", re.I)
++_GUAR_CTX = re.compile(r"guarantee", re.I)
++_UNIT_PREV = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(" + _UNIT_WORD + r")\b[^.]{0,120}$", re.I)
++
++
++def _sentence_before(full_text: str, pos: int, span: int = 900) -> str:
++    """The text from the start of the last running sentence before pos up to pos. For a table cell this
++    reaches back over the header and rows to the sentence that introduces the table."""
++    seg = full_text[max(0, pos - span):pos]
++    line = seg[seg.rfind("\n") + 1:]
++    if len(re.findall(r"[A-Za-z]{2,}", line)) >= 8:   # the figure sits in a running sentence: that sentence
++        lb = [m.end() for m in re.finditer(r"\.\s+(?=[A-Z(])", line)]
++        return line[lb[-1]:] if lb else line
++    bounds = [m.end() for m in re.finditer(r"\.\s+(?=[A-Z(•\-])", seg)]
++    for b in reversed(bounds):
++        part = seg[b:]
++        if any(len(re.findall(r"[A-Za-z]{2,}", ln)) >= 8 for ln in part.split("\n")):
++            return part
++    return seg
++
++
++def _sentence_after(full_text: str, pos: int, span: int = 300) -> str:
++    seg = full_text[pos:pos + span]
++    m = re.search(r"\.\s+(?=[A-Z(])|\n\s*\n", seg)
++    return seg[:m.start()] if m else seg
++
++
++def _staged_item_checks(uid: str, ed: int, kept: list, where: list, heads: list, unclear: list,
++                        full_text: str, notes: list, rec: dict):
++    """PATCH 13-Oct-2026: drop figures that cannot count, by the auditor's own table / sentence."""
++    u = uid.lower()
++    keep = []
++    kinds = []
++    for i, ((printed, v), (pos, note_txt)) in enumerate(zip(kept, where)):
++        kind = cell_kind(full_text, pos) if (pos >= 0 and amt_switch_on("TABLE_COLUMNS")) else None
++        kinds.append(kind)
++        num = (_FIG.search(str(printed)) or _FIG.search("0")).group("num")
++        after = full_text[pos + len(num): pos + len(num) + 30] if pos >= 0 else ""
++        before = full_text[max(0, pos - 160):pos] if pos >= 0 else ""
++        sent = (_sentence_before(full_text, pos) + _sentence_after(full_text, pos)) if pos >= 0 else ""
++        why = None
++        own_src = rec.get("_clause_src") or ""
++        other_src = rec.get("_other_src") or ""
++        digits_ = re.sub(r"\D", "", num)
++        if amt_switch_on("OWN_CLAUSE_ONLY") and own_src and other_src and len(digits_.lstrip("0")) >= 4 \
++                and not appears_in(printed, own_src) and appears_in(printed, other_src):
++            # the figure is printed in another clause's passage and not in this one (Ichalkaranji 2022-23:
++            # the (v) deposits figure "Rs. 7383 thousand" taken as the (vii)(a) arrears amount)
++            why = "figure_of_another_clause"
++        elif amt_switch_on("NOT_MONEY") and (_AREA.search(str(printed)) or _AREA.match(after.strip()[:12] or "x-x")
++                                    or re.match(r"\s*(?:acres?|hectares?|ghunt\w*|guntha|sq)", after, re.I)):
++            why = "area_not_money"
++        elif amt_switch_on("NOT_MONEY") and pos >= 0 and _THRESHOLD_BEFORE.search(before[-40:]) \
++                and v is not None and abs(v - 5e7) < 1 and re.search(r"working\s+capital|sanction", sent, re.I):
++            why = "threshold_not_amount"
++        elif kind in ("paid",):
++            why = "paid_under_protest_column"
++        elif kind in ("opening", "prior"):
++            why = kind + "_column"
++        elif kind in ("flow", "not_last") and u in LOANISH[ed]:
++            why = "during_the_year_column"
++        elif amt_switch_on("OPENING_PROSE") and kind is None and u in LOANISH[ed] and pos >= 0 and len(kept) > 1:
++            ctx = full_text[max(0, pos - 160):pos]
++            lastnum = list(re.finditer(r"\d[\d,]*\.?\d*\s*(?:" + _UNIT_WORD + r")?", ctx))
++            ctx = ctx[lastnum[-1].end():] if lastnum and lastnum[-1].end() < len(ctx) - 1 else ctx
++            mo = list(_OPENING_WORDS.finditer(ctx))
++            if mo and not _YEAR_END_WORDS.search(ctx[mo[-1].end():]) \
++                    and not re.search(r"includ\w*\s+(?:the\s+)?(?:opening|balance)", ctx, re.I):
++                why = "opening_balance"
++        if why is None and amt_switch_on("BALANCE_NOT_DEFAULT") and u in DEFAULT_UNITS[ed] and pos >= 0 \
++                and _BALANCE_BEFORE.search(full_text[max(0, pos - 110):pos]) and not _DEFAULT_WORDS.search(sent):
++            why = "loan_balance_not_a_default"
++        if why is None and amt_switch_on("UNDISPUTED_IN_VII_B") and u == "vii_b" and pos >= 0 \
++                and not _in_disputed_table(full_text, pos):
++            sb = _sentence_before(full_text, pos) + _sentence_after(full_text, pos)
++            if _UNDISPUTED_SENT.search(sb) and not _DISPUTE_SENT.search(re.sub(r"(?i)undisputed", "", sb)):
++                why = "undisputed_arrears_belong_to_vii_a"
++                rec.setdefault("_undisputed_moved", []).append((printed, v))
++        if why:
++            notes.append(why + ": " + str(printed))
++            continue
++        # "Rs.1009 thousand and total outstanding balance Rs.9563": the unit of the sentence
++        if amt_switch_on("UNIT_CARRY") and pos >= 0 and v is not None:
++            fm = _FIG.search(str(printed))
++            if fm and not fm.group("unit") and not fm.group("dash") and "," not in fm.group("num") \
++                    and "." not in fm.group("num") and currency_before(full_text, pos) \
++                    and not inline_unit(full_text, pos, fm.group("num")) and heads[i] == 1.0:
++                seg = re.sub(r"(?:rs\.?|₹|inr|\?)\s*\.?\s*$", "", full_text[max(0, pos - 150):pos], flags=re.I)
++                mprev = _UNIT_PREV.search(seg)
++                if mprev:
++                    v = v * _mult(mprev.group(1))
++                    notes.append("unit_carried_from_sentence: " + str(printed))
++        keep.append(i)
++        kept[i] = (printed, v)
++    nk = [kept[i] for i in keep]
++    nw = [where[i] for i in keep]
++    nh = [heads[i] for i in keep]
++    nkind = [kinds[i] for i in keep]
++    # LOAN VS. GUARANTEE (approved rule): a guarantee is never added to a funded loan
++    if u in LOANISH[ed] and len(nk) > 1:
++        g = [j for j, (p, n) in enumerate(nw)
++             if nkind[j] == "guarantee" or _GUAR_CTX.search(n or "") or (p >= 0 and _GUAR_CTX.search(full_text[max(0, p - 60):p]))]
++        if g and len(g) < len(nk):
++            notes.append("guarantee_not_added_to_loan: " + ", ".join(nk[j][0] for j in g))
++            nk = [x for j, x in enumerate(nk) if j not in g]
++            nw = [x for j, x in enumerate(nw) if j not in g]
++            nh = [x for j, x in enumerate(nh) if j not in g]
++    nu = [x for x in unclear if x in {k for k, _ in nk}]
++    return nk, nw, nh, nu
++
++
++def _staged_table_amount(rec: dict, uid: str, window: Optional[str], full_text: str, ed: int):
++    """PATCH 13-Oct-2026: amounts read from a table the auditor printed for (iii)(a) / (ii)(b)."""
++    u = uid.lower()
++    if u in ("iii_a_a", "iii_a_b") and ed == 2020 and amt_switch_on("III_A_TABLE") and window:
++        seg = window
++        wpos = full_text.find(window[:120]) if len(window) >= 40 else -1
++        if wpos >= 0:
++            mstart = max([m.start() for m in _MAIN_MARK.finditer(full_text, max(0, wpos - 6000), wpos + 1)] or [max(0, wpos - 3000)])
++            seg = full_text[mstart:wpos + len(window)]
++        res = iii_a_slot_figures(seg, "A" if u == "iii_a_a" else "B")
++        if res is not None:
++            figs, note = res
++            items = []
++            for printed in figs:
++                p = seg.find(printed)
++                hs = list(_HEADING.finditer(seg[:max(p, 0)]))
++                h = _mult(next(g for g in hs[-1].groups() if g)) if hs else 1.0
++                items.append((printed, to_rupees(printed, h)))
++            if any(v is None for _, v in items):
++                return None
++            total = round(sum(v for _, v in items), 2) if items else None
++            return {"amount_total": total, "items": items, "method": "iii_a_table", "note": note}
++    if u == "ii_b" and amt_switch_on("II_B_DIFF"):
++        nf = rec.get("normalized_fields") or {}
++        poss = []
++        for it in nf.get("amount_items") or []:
++            pr = it.get("as_printed") if isinstance(it, dict) else it
++            if pr and appears_in(pr, full_text):
++                poss.append(locate_figure(pr, rec.get("evidence_text"), full_text))
++        if window and full_text:
++            wpos = full_text.find(window[:200]) if len(window) >= 40 else -1
++            m = re.search(r"amount of difference|\bdifference\b", window, re.I)
++            if wpos >= 0 and m:
++                after = full_text[wpos + m.end(): wpos + m.end() + 400]
++                mm = re.search(r"\n\s*(\d[\d,]*(?:\.\d+)?)\s*\n", after)
++                if mm:
++                    poss.append(wpos + m.end() + mm.start(1))
++        hit = ii_b_difference(full_text, poss)
++        if hit:
++            printed, p, note = hit
++            h = heading_at(full_text, p, 2500)
++            return {"amount_total": round(to_rupees(printed, h) or 0, 2) or None, "items": [(printed, to_rupees(printed, h))],
++                    "method": "ii_b_table", "note": note}
++        # prose, from the figures the model listed (counted or not): "a difference of Rs. 359.08 lacs"
++        # wins; else two balances in one sentence, books vs statement -> their difference
++        listed = []
++        for it in nf.get("amount_items") or []:
++            pr = it.get("as_printed") if isinstance(it, dict) else it
++            if pr and appears_in(pr, full_text):
++                lp = locate_figure(pr, rec.get("evidence_text"), full_text)
++                if lp >= 0:
++                    fm_ = _FIG.search(str(pr))
++                    iu_ = None if (fm_ and fm_.group("unit")) else inline_unit(full_text, lp, fm_.group("num") if fm_ else "")
++                    vv = (float(fm_.group("num").replace(",", "")) * iu_) if (fm_ and iu_) else to_rupees(pr, heading_at(full_text, lp, 2500))
++                    listed.append((str(pr), vv, lp))
++        for pr, vv, lp in listed:
++            if vv and re.search(r"difference\s+of\s*(?:rs\.?|₹|inr|\?)?\s*\.?\s*$", full_text[max(0, lp - 40):lp], re.I):
++                return {"amount_total": round(vv, 2), "items": [(pr, vv)], "method": "ii_b_prose",
++                        "note": "ii_b: difference printed by the auditor"}
++        if len(listed) == 2 and all(v for _, v, _ in listed):
++            a_, b_ = sorted(listed, key=lambda x: x[2])
++            between = full_text[max(0, a_[2] - 300):b_[2] + 60]
++            if b_[2] - a_[2] < 400 and re.search(r"books", between, re.I) and re.search(
++                    r"statement|returns?\b|submitted to (?:the )?bank|reported", between, re.I) and a_[1] != b_[1]:
++                d = abs(a_[1] - b_[1])
++                return {"amount_total": round(d, 2), "items": [(a_[0], a_[1]), (b_[0], b_[1])], "method": "ii_b_prose",
++                        "note": "ii_b: difference of the two balances printed (books vs statement)"}
++        txt = window or ""
++        m = re.search(r"difference\s+of\s+((?:rs\.?|₹|inr)\s*" + _NUM + r"\s*(?:/-)?\s*(?:" + _UNIT_WORD + r")?)", txt, re.I)
++        if m:
++            v = to_rupees(m.group(1), unit_heading(txt))
++            if v:
++                return {"amount_total": round(v, 2), "items": [(m.group(1).strip(), v)], "method": "ii_b_prose",
++                        "note": "ii_b: difference printed by the auditor"}
++        for sm in re.finditer(r"[^.]*?books[^.]*?(?:\.\d[^.]*?)*\.", txt, re.I | re.S):
++            sent = sm.group(0)
++            if not re.search(r"statement|returns?\b|submitted to (?:the )?bank|reported", sent, re.I):
++                continue
++            figs = [(p_, v_) for p_, v_ in figures_in(sent) if v_ and v_ > 0]
++            if len(figs) == 2 and figs[0][1] != figs[1][1]:
++                d = abs(figs[0][1] - figs[1][1])
++                return {"amount_total": round(d, 2), "items": figs, "method": "ii_b_prose",
++                        "note": "ii_b: difference of the two balances printed (books vs statement)"}
++        return "LARGEST"                     # several quarterly differences listed: take the largest, never the sum
++    return None
++
++
+ def compute(rec: dict, uid: str, window: Optional[str], full_text: str, order_year) -> dict:
+     """Amount for one unit. Returns {"amount_total", "items", "method", "note"}."""
+     nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+@@ -680,6 +1331,14 @@
+     if heading == 1.0:
+         heading = heading_above(rec.get("evidence_text"), full_text)
+     ed = 2016 if (order_year is not None and int(order_year) < 2020) else 2020
++    staged = is_staged(rec)                    # PATCH 13-Oct-2026: two-call records only
++    largest_only = False
++    if staged:
++        early = _staged_table_amount(rec, uid, window, full_text, ed)
++        if early == "LARGEST":
++            largest_only = True
++        elif early is not None:
++            return early
+     items_in = nf.get("amount_items")
+     # 1. the model's list of figures as printed
+     if isinstance(items_in, list) and items_in:
+@@ -736,6 +1395,51 @@
+                 if (h_item == 1.0 and fm and not fm.group("unit")
+                         and not fm.group("dash") and "." in fm.group("num") and v < 100):
+                     unclear.append(str(printed))
++        if staged and len(where) >= 3:
++            # PATCH 13-Oct-2026: a figure found far from the others ("0.73" printed elsewhere first) is
++            # re-located to its occurrence nearest the rest of the table
++            ps = sorted(p for p, _ in where if p >= 0)
++            if ps:
++                med = ps[len(ps) // 2]
++                for j, (p, n) in enumerate(where):
++                    if p >= 0 and abs(p - med) > 1500:
++                        num = _FIG.search(str(kept[j][0])).group("num")
++                        occ = _figure_positions(num, full_text)
++                        if occ:
++                            best = min(occ, key=lambda o: abs(o - med))
++                            if abs(best - med) < abs(p - med):
++                                where[j] = (best, n)
++        if staged:
++            kept, where, heads, unclear = _staged_item_checks(uid, ed, kept, where, heads, unclear,
++                                                              full_text, p1notes, rec)
++            # PATCH 13-Oct-2026: rows of the same table column (loan / deposit tables) the model left out
++            if amt_switch_on("ROW_COMPLETE") and uid.lower() in LOANISH[ed] and len(kept) >= 2 \
++                    and all(p >= 0 for p, _ in where) and len(set(heads)) == 1:
++                col = table_column_cells(full_text, where[0][0])
++                if col and len(col) > len(kept):
++                    cps = {p for _, p, _ in col}
++                    from collections import Counter as _Ctr
++                    colv = _Ctr(_FIG.search(c[0]).group("num").replace(",", "") for c in col)
++                    kv = _Ctr(_FIG.search(k).group("num").replace(",", "") for k, _ in kept)
++                    if all(colv[k] >= n for k, n in kv.items()) and not any(
++                            _FIG.search(c[0]).group("num").replace(",", "") in excluded_vals for c in col):
++                        add = []
++                        for c in col:
++                            k = _FIG.search(c[0]).group("num").replace(",", "")
++                            if kv.get(k, 0) > 0:
++                                kv[k] -= 1
++                            elif (to_rupees(c[0], heads[0]) or 0) > 0:
++                                add.append((c[0], to_rupees(c[0], heads[0]), c[1]))
++                        if add and all(v is not None for _, v, _ in add):
++                            kept = kept + [(a, v) for a, v, _ in add]
++                            where = where + [(p, "table row") for _, _, p in add]
++                            heads = heads + [heads[0]] * len(add)
++                            p1notes.append("table_rows_added: " + ", ".join(a for a, _, _ in add))
++            if largest_only and len(kept) > 1:
++                top = max(range(len(kept)), key=lambda j: kept[j][1] or 0)
++                p1notes.append("ii_b_largest_difference_not_sum: " + kept[top][0])
++                kept, where, heads = [kept[top]], [where[top]], [heads[top]]
++                unclear = [x for x in unclear if x == kept[0][0]]
+         # PATCH 7-Oct (Phase 1, F15): rows of the same table column the model left out
+         if uid.lower() in SUMMABLE[ed] and not unclear and len(kept) >= 2:
+             done = _complete_table_column(full_text, kept, where, heads, excluded_vals)
+@@ -771,7 +1475,8 @@
+             unclear = [u for u in unclear if u == kept[0][0]]
+         # 1-Oct (A6c): (iii)(a) - loans GIVEN during the year and the BALANCE
+         # outstanding are flow and stock of the same loans; never add them up
+-        elif uid.lower() in ("iii_a_a", "iii_a_b", "iii_a") and len(kept) > 1:
++        elif (uid.lower() in ("iii_a_a", "iii_a_b", "iii_a")
++              or (staged and uid.lower() in LOANISH[ed])) and len(kept) > 1:
+             kinds = [_flow_or_stock(full_text, p, n) for (p, n) in where]
+             if "stock" in kinds and "flow" in kinds:
+                 keep_idx = [i for i, k in enumerate(kinds) if k == "stock"]
+@@ -813,9 +1518,28 @@
+             win_use = _cut_other_clause(window, uid, ed)
+             win_use = _cut_disputed_table(win_use) if uid.lower() == "vii_a" else win_use
+             figs = figures_in(win_use, heading)
++            tnote = None
++            if staged and figs:
++                # PATCH 13-Oct-2026: the same checks on figures read from the text
++                tw = []
++                for p_, _v in figs:
++                    lp = locate_figure(p_, rec.get("evidence_text"), full_text)
++                    bt = re.sub(r"(?i)rs\.", "rs", full_text[max(0, lp - 120):lp]) if lp >= 0 else ""
++                    tw.append((lp, "interest" if re.search(r"interest[^.\n]{0,60}$", bt, re.I) else ""))
++                drop_i = _interest_already_included(full_text, figs, tw) if amt_switch_on("INTEREST_TEXT") else []
++                tn = []
++                if drop_i:
++                    tn.append("interest_already_included_not_added: " + ", ".join(figs[i][0] for i in drop_i))
++                    figs = [f for i, f in enumerate(figs) if i not in drop_i]
++                    tw = [w for i, w in enumerate(tw) if i not in drop_i]
++                figs, tw, _h, _u = _staged_item_checks(uid, ed, list(figs), list(tw), [heading] * len(figs), [],
++                                                       full_text, tn, rec)
++                tnote = "; ".join(tn) or None
+             vals = _drop_total_row([v for _, v in figs])
+             if vals:
+-                return {"amount_total": round(sum(vals), 2), "items": figs, "method": "text", "note": None}
++                return {"amount_total": round(sum(vals), 2), "items": figs, "method": "text", "note": tnote}
++            if staged and tnote:
++                return {"amount_total": None, "items": [], "method": "text", "note": tnote}
+     else:
+         ambiguous = None
+     if uid in FIRST_FIGURE[ed] and window:
+@@ -930,6 +1654,98 @@
+ _WINDOW = 12000          # an arrears table can run to 10+ rows of long text
+ 
+ 
++def _digits_set(items) -> set:
++    out = set()
++    for p, _ in items or []:
++        nums = [m.group("num").replace(",", "") for m in _FIG.finditer(str(p))]
++        nums = [n for n in nums if not re.fullmatch(r"(?:19|20)\d\d", n)] or nums
++        if nums:
++            out.add(max(nums, key=lambda n: float(n) if re.fullmatch(r"\d+(?:\.\d+)?", n) else 0))
++    return out
++
++
++def _set_amount(rec: dict, total, items, method: str, note: str) -> None:
++    nf = rec.setdefault("normalized_fields", {})
++    nf["amount_total"] = total
++    rec["amount_calc"] = {"method": method, "note": note,
++                          "items": [{"as_printed": p, "rupees": v} for p, v in (items or [])][:40]}
++
++
++def _staged_sibling_fix(subs: list, main_id: str, changed: list) -> None:
++    """PATCH 13-Oct-2026: one printed figure belongs to one sub-clause.
++    (vii): undisputed arrears dropped from (vii)(b) go to (vii)(a) when (vii)(a) is a finding with no
++    amount (Shri Dutt 2022-23, Apollo 2020-21). (xx): a (xx)(b) figure that is also (xx)(a)'s stays on
++    (xx)(a) (Jsons 2023-24, Western 2024-25). (iii)(a): the same figures on (A) and (B) stay only on the
++    slot the unit's own text names (Viraj Alchohol 2023-24: 'associate concern' is (B))."""
++    from .post_rules import _unit_id
++    by = {_unit_id(s, "sub", main_id).lower(): s for s in subs}
++    amt = lambda r: ((r or {}).get("normalized_fields") or {}).get("amount_total")
++    items = lambda r: [(i.get("as_printed"), i.get("rupees")) for i in ((r or {}).get("amount_calc") or {}).get("items") or []]
++    if amt_switch_on("UNDISPUTED_IN_VII_B") and "vii_b" in by:
++        b = by["vii_b"]
++        moved = b.pop("_undisputed_moved", None)
++        a = by.get("vii_a")
++        if moved and a is not None and a.get("classification") in ("qualified", "adverse") and not amt(a):
++            vals = [v for _, v in moved if v]
++            if vals:
++                _set_amount(a, round(sum(vals), 2), moved, "moved_from_vii_b",
++                            "undisputed arrears printed under the auditor's (b)")
++                changed.append(("vii_a", "moved_from_vii_b", amt(a)))
++    for s in subs:
++        s.pop("_undisputed_moved", None)
++    if not amt_switch_on("SIBLING_DUP"):
++        return
++    pairs = [("xx_a", "xx_b", None), ("iii_a_a", "iii_a_b", "slot")]
++    for x, y, how in pairs:
++        rx, ry = by.get(x), by.get(y)
++        if not (rx and ry and amt(rx) and amt(ry)):
++            continue
++        dx, dy = _digits_set(items(rx)), _digits_set(items(ry))
++        if not dy or not dy <= dx and not dx <= dy:
++            continue
++        if how is None:
++            if dy <= dx:
++                _set_amount(ry, None, [], "same_figure_as_" + x, "the figure is " + x + "'s")
++                changed.append((y, "same_figure_as_" + x, None))
++            continue
++        if dx != dy:
++            continue
++        src = (((rx.get("normalized_fields") or {}).get("source_text") or "") + " " +
++               ((ry.get("normalized_fields") or {}).get("source_text") or ""))
++        names_a = bool(_SLOT_A.search(src))
++        lose = ry if names_a else rx
++        lid = y if names_a else x
++        _set_amount(lose, None, [], "same_figure_on_other_slot", "the figure belongs to the other (iii)(a) slot")
++        changed.append((lid, "same_figure_on_other_slot", None))
++
++
++def _show_amount_source(rec: dict, items: list, text: str) -> None:
++    """PATCH 13-Oct-2026: when a counted figure is not in the unit's source_text, add the auditor's
++    table row / sentence that holds it, so the evidence shows where the amount comes from."""
++    nf = rec.get("normalized_fields") or {}
++    src = nf.get("source_text") or ""
++    flat = re.sub(r"(?<=\d),(?=\d)", "", src)
++    add = []
++    for printed, _ in items:
++        m = _FIG.search(str(printed))
++        if not m:
++            continue
++        if appears_in(printed, flat) or appears_in(printed, src):
++            continue
++        p = locate_figure(printed, rec.get("evidence_text"), text)
++        if p < 0:
++            continue
++        a = max(text.rfind("\n\n", 0, p), text.rfind(". ", 0, p), p - 300) + 1
++        b_ = text.find("\n", p + len(m.group("num")))
++        b_ = len(text) if b_ < 0 else b_
++        snippet = " ".join(text[a:b_].split())
++        if snippet and snippet not in " ".join(src.split()) and snippet not in add:
++            add.append(snippet[-400:])
++    if add and src and src != "-":
++        nf["source_text"] = src.rstrip() + "\n" + "\n".join(add)
++        rec["source_text_amount_rows_added"] = add
++
++
+ def apply_amounts(records: list, caro_text: Optional[str], order_year) -> list:
+     """Set normalized_fields.amount_total on every unit by the rules above.
+     The model's figure is kept as llm_amount_total and the working as
+@@ -948,8 +1764,10 @@
+         before = nf.get("amount_total")
+         rec["llm_amount_total"] = before
+         cls = rec.get("classification")
++        ed_ = 2016 if (order_year is not None and int(order_year) < 2020) else 2020
+         if cls in ("insufficient_evidence", "not_applicable", None):
+             res = {"amount_total": None, "items": [], "method": "no_finding", "note": None}
++
+         elif rec.get("csr_late_rupees"):
+             res = {"amount_total": rec["csr_late_rupees"], "items": rec.get("csr_late_items") or [],
+                    "method": "csr_schedule", "note": None}
+@@ -962,6 +1780,12 @@
+                 # reading the text is only for findings; a favourable unit
+                 # keeps only figures the model itself listed or that match
+                 res = {"amount_total": None, "items": [], "method": "none", "note": None}
++            if (cls == "clean" and is_staged(rec) and amt_switch_on("FAV_NO_AMOUNT")
++                    and uid.lower() not in EXPOSURE[ed_] and res["amount_total"]):
++                # PATCH 13-Oct-2026: a Favourable answer to a question that is not an exposure ((ii)(b),
++                # (iii)(b)-(e), (vii), (ix) ...) carries no amount (Garden Court 2024-25 (iii)(b), Refit (ii)(b))
++                res = {"amount_total": None, "items": [], "method": "favourable_no_amount",
++                       "note": "figures not shown on a favourable answer: " + ", ".join(p for p, _ in res["items"][:10])}
+         nf["amount_total"] = res["amount_total"]
+         if res["method"] in ("model_items", "text", "text_first_figure", "csr_schedule"):
+             fixt = correct_explanation_total(rec, res["amount_total"])      # improvement 5
+@@ -969,6 +1793,8 @@
+                 rec["explanation_total_corrected"] = fixt
+         rec["amount_calc"] = {"method": res["method"], "note": res["note"],
+                               "items": [{"as_printed": p, "rupees": v} for p, v in res["items"]][:40]}
++        if is_staged(rec) and amt_switch_on("EVIDENCE_SHOWS_AMOUNT") and res["items"] and res["amount_total"]:
++            _show_amount_source(rec, res["items"], text)
+         if (before or None) != (res["amount_total"] or None):
+             changed.append((uid, res["method"], res["amount_total"]))
+ 
+@@ -977,8 +1803,18 @@
+             continue
+         main_id = str(r.get("main_clause_id", "")).strip().lower().strip("()")
+         subs = [s for s in (r.get("sub_clauses") or []) if isinstance(s, dict)]
++        msrc = ((r.get("normalized_fields") or {}).get("source_text") or "")
++        osrc = "\n".join(((x.get("normalized_fields") or {}).get("source_text") or "")
++                          for x in records if isinstance(x, dict) and x is not r)
+         for s in subs:
++            if is_staged(s):
++                s["_clause_src"] = (((s.get("normalized_fields") or {}).get("source_text") or "") + "\n" + msrc)
++                s["_other_src"] = osrc
+             one(s, _unit_id(s, "sub", main_id))
++            s.pop("_clause_src", None)
++            s.pop("_other_src", None)
++        if subs and any(is_staged(s) for s in subs):
++            _staged_sibling_fix(subs, main_id, changed)          # PATCH 13-Oct-2026
+         if subs:
+             nf = r.get("normalized_fields")
+             if not isinstance(nf, dict):
+@@ -1022,5 +1858,11 @@
+                 r.pop("llm_amount_total", None)
+                 one(r, main_id)
+         else:
++            if is_staged(r):
++                r["_clause_src"] = ((r.get("normalized_fields") or {}).get("source_text") or "")
++                r["_other_src"] = "\n".join(((x.get("normalized_fields") or {}).get("source_text") or "")
++                                             for x in records if isinstance(x, dict) and x is not r)
+             one(r, main_id)
++            r.pop("_clause_src", None)
++            r.pop("_other_src", None)
+     return changed
+--- a/caro/staged_llm.py
++++ b/caro/staged_llm.py
+@@ -78,7 +78,38 @@
+     "F33": True,      # post_rules: (xvii) cash loss stated with a non-zero amount
+     "F34": True,      # 13-Oct (Toby): (ix)(e)/(ix)(f) NA only when no subsidiaries/JV/associates or the clause is said not to apply
+     "NO_LABELS": True,  # 13-Oct: Call 2 schema requires label/quote/explanation; a reply with no labels fails loudly
++    "AMT_PROMPT": True,  # 13-Oct (amounts): Call 1 rules on which printed figures are listed / counted
++    # 13-Oct (mapping / Option C, Toby): each can be switched off on its own
++    "XWALK_LAYOUT": True,  # crosswalk only for real CARO 2016 / hybrid layouts; mixed numbering -> subject-only note
++    "SUBJ_2016": True,     # CARO 2016 units get the subject words of their CARO 2020 successor (clause map)
++    "ONE_UNIT": True,      # Call 1: a unit's source_text answers only its own question; Call 2: judge the whole text
++    "F35": True,           # recheck note: a unit's OWN text is on another unit's subject / is only the printed question
++    "MOVE_PASSAGE": True,  # a Call 2 move of clause-passage words to another unit is applied (words verified)
++    "OWN_TEXT": True,      # post_rules: a label is softened only when the unit's own clean text agrees
++    "TABLE_QUOTE": True,   # a table quote the model re-wrote is replaced by the auditor's own lines
++    # 13-Oct evening batch (register P-ids; Toby approved 13-Oct 20:27). Each can be switched off on its own.
++    "P1": True,    # TRIAL - (vii)(b) with no dispute text: the dispute sentence / table of the (vii) paragraph in a note
++    "P2": True,    # "hence / accordingly not applicable" after a favourable finding: prompt line + note
++    "P4": True,    # (iii)(a) is judged on the amounts only (prompt line)
++    "P5": True,    # a move target takes the recheck answer only when the moved words really changed its text
++    "P6": True,    # F16: a negation anywhere before the name in the sentence; keep (B)'s own denial
++    "P7A": True,   # TRIAL - post_rules: CSR "s.135 applicable but has not been complied with" -> adverse trigger
++    "P7B": True,   # TRIAL - note: particulars announced ("as under", "following") but not given -> dangling
++    "P7C": True,   # TRIAL - note: (vii)(a) answer while arrears > 6 months are listed in its own text
++    "P7D": True,   # TRIAL - note: (xiv)(a) internal audit required but not carried out
++    "P7E": True,   # TRIAL - note: "insufficient" although the model's own explanation calls the answer incomplete
++    "P8": True,    # note: an explanation that guesses ("implying", "presumably", "by default")
++    "P10": True,   # post_rules: no NA from a sentence with a carve-out / another sub-clause's marker or subject
++    "P11": True,   # post_rules: wordings the rules missed (intangibles, (iv) director loans, "unable to say")
++    "P13": True,   # Call 1: source_text limit per filing; a runaway field is cut, a long field asked once more (+20%)
++    "P15": True,   # (viii) convention example (prompt line)
++    "P16": True,   # TRIAL - note: "except as given in Para (b)" -> the paragraph it points to, from its own clause
++    "P18": True,   # (x)(b): rights issue / allotment without a compliance statement (prompt line)
+ }
++# PATCH 13-Oct-2026 (Toby): fixes on trial in the next run. A unit any of them touches gets the review reason
++# "trial:<fix>" (an existing review_reasons value, no new JSON key) so the run shows every effect. Remove a fix
++# from this set once the run confirms it; empty the set to remove all trial flags.
++TRIAL_FIXES = {"P1", "F35", "P16", "P7A", "P7B", "P7C", "P7D", "P7E"}
+ 
+ 
+ def _on(fix: str) -> bool:
+@@ -236,6 +267,65 @@
+ """
+ 
+ 
++# PATCH 13-Oct-2026 (Phase 2, amounts). CALL 1 only. WHY: 13-Oct run - the model listed a "deposited under
++# protest" column (Aditya 2020-21 (vii)(b)), previous-year cells (Western 2020-21 (v)), the Rs 5 crore
++# limit (Refit (ii)(b)), "110 acre" (Shri Dutt (i)(c)), opening balances (Garden Court (iii)(a)), the
++# subsidiaries' row under (iii)(a)(B) (WickedRide), loan balances as defaults (Viraj Canes (ix)(a)),
++# dropped principal instalments (Viraj Alchohol (viii)) and a (v) deposits figure as (vii)(a) arrears
++# (Ichalkaranji 2022-23). The code also checks these (caro/amounts.py, AMOUNT_SWITCHES); this tells the model.
++_CALL1_AMOUNTS = r"""
++AMOUNT ITEMS - which printed figures to list, and which count:
++  - List only the money figures that answer THIS unit's question, copied exactly as printed (keep
++    "Rs."/"₹" and a unit word printed next to the figure). A figure printed in another clause's
++    passage is never this unit's amount. Copying a table into source_text does not make every cell
++    an amount.
++  - counts_toward_total is false for: amounts paid / deposited under protest or as pre-deposit;
++    previous-year (comparative) columns; opening balances ("outstanding at the beginning of the
++    year"); amounts given or accepted DURING the year when the year-end balance is also printed;
++    a guarantee when a funded loan balance is printed for the same party (LOAN VS. GUARANTEE);
++    a "Total" row that repeats the rows.
++  - Never list: a sanction limit or threshold ("working capital limits in excess of Rs. 5 crores"),
++    an area (acre, guntha, hectare, sq. ft), a count of shares, days or cases, a percentage, a year
++    or a date.
++  - In a table, list the cells of the column that answers the question, row by row, including
++    rows whose cell is 0.00 (write "0.00") - so the column can be read; never mix columns.
++  - (vii)(a) and (vii)(b) are different findings: undisputed arrears go only under (vii)(a), disputed
++    dues (a table with a forum / "pending before") only under (vii)(b), whatever letter the auditor
++    printed.
++  - (iii)(a) tables: figures on the Subsidiaries / joint ventures / associates row belong to
++    (iii)(a)(A); figures on the Others / employees / any other parties row belong to (iii)(a)(B).
++  - (ix)(a) and CARO 2016 (viii): list every instalment not paid on its due date - principal AND
++    interest - from the "amount not paid on due date" column. A loan's outstanding balance is not a
++    default amount (list it with counts_toward_total false).
++  - (ii)(b): list the "difference" figures printed; when only the two values are printed (books vs
++    quarterly statement), list both with counts_toward_total false.
++"""
++
++
++# PATCH 13-Oct-2026 (mapping, ONE_UNIT). WHY: the 13-Oct review found 17 units holding text that answers
++# another unit (Jsons 2021-22 (xvii) <- the (xix) "capable of meeting its liabilities" sentence; Studio XP
++# 2024-25 printed (c)/(d)/(e) = (ix)(d)/(e)/(f); Garden Court 2024-25 (ix)(c) <- the short-term-funds
++# sentence; K.R. Foods 2023-24 (iii)(f) <- only the printed question), and Shri Dutt (vii)(a) answered
++# "except as given in Para (b) below" while Para (b) - the arrears list - sat on (vii)(b). Call 2 then
++# judged those units on the wrong words. Two-call flow only.
++_CALL1_ONE_UNIT = r"""
++ONE UNIT, ONE ANSWER - the sub-clause text that step 2 judges:
++  - A sub-clause's source_text holds ONLY the sentences, list items and table rows that answer ITS
++    OWN official question (CLAUSE MAP). Stop at the first sentence that answers another unit's
++    question, even when the auditor printed no new number or letter before it.
++  - The auditor's numbers and letters are often out of step with the Order (a letter skipped, two
++    points merged, a CARO 2016 number, a shifted list). Follow the SUBJECT: a printed "(c)" that
++    speaks of short-term funds used for long-term purposes is (ix)(d), whatever its letter.
++  - A sentence goes on one unit only. It goes on more than one only when it is a blanket statement
++    covering them all, or for the twin markers (i)(a)(A)/(B) and (iii)(a)(A)/(B) answered together.
++  - A printed CARO question with nothing after it is not an answer: that unit's source_text is "-".
++  - "except as given in Para (b) below" / "as stated below": when the passage it points to is on
++    THIS unit's subject (e.g. undisputed dues in arrears listed under the auditor's "(b)"), that
++    passage is part of this unit's answer - place it here, not on the unit with the printed letter.
++  - The MAIN clause's source_text still holds the auditor's complete passage for the clause.
++"""
++
++
+ CALL1_TITLE = "caro_step1_extract_map"
+ CALL2_TITLE = "caro_step2_check_classify"
+ CALL1_ROLE = "You are a chartered-accountant-grade analyst. STEP 1 OF 2 - EXTRACT AND MAP."
+@@ -262,6 +352,58 @@
+     return order_year is not None and int(order_year) < 2020
+ 
+ 
++# PATCH 13-Oct-2026 (mapping, SUBJ_2016). WHY: the clause map gives subject words only for the 60 CARO 2020
++# units, so for CARO 2016 filings no code check of the placement ran (M10 / M11). Each CARO 2016 unit takes the
++# subject words of its CARO 2020 successor named in the clause map (caro_2016_units.caro_2020_successor);
++# (xi) managerial remuneration has no successor and uses the M9 words.
++_XI_2016_RX = r"managerial remuneration|section 197|schedule v\b"
++
++
++# PATCH 13-Oct-2026 (mapping, XWALK_LAYOUT). WHY: edition.report_layout calls a report "hybrid" when it finds no
++# CARO 2016 clause anchor and one CARO 2016 phrase ("initial public offer ... and term loans", which many CARO
++# 2020 reports copy). 8 filings of the 13-Oct run written in the CARO 2020 layout were therefore given the
++# CARO 2016 crosswalk ("printed (iii)(a) -> (iii)(b)", "printed (xiv) -> (x)(b)") - Saspack 2022-23..2024-25
++# (numbered 1-21, "9. Default in repayment"), U72900DL2007PTC162708 2021-22..2024-25 (cites "clause 3(x)(a)",
++# "3(xvi)(d)") and Garden Court 2024-25. Real hybrids (Western / Jsons 2021-22, Atharv 2021-22..2024-25:
++# CARO 2016 anchors 4, 4-5 new topics, no CARO 2020 sub-clause citations) keep the crosswalk. Reports whose
++# printed numbers follow neither Order (Prasad 2022-23: (x) public offer, (xi) fraud, (xii) s.197, (xiii) Nidhi)
++# get a subject-only note. Two-call flow only: edition.py and the single prompt are unchanged.
++_CITE_2020_SUB = re.compile(r"(?:\b3\s*|\bclause\s*|\bpara(?:graph)?\s*(?:3\s*)?)\(\s*(ix|x|xi|xii|xiv|xvi|xx)\s*\)"
++                            r"\s*\(\s*([a-f])\s*\)", re.I)
++_MIXED_NUMBERING_NOTE = (
++    "NUMBERING NOTE - the clause numbers printed in this report follow neither Order consistently (an item is "
++    "numbered as in CARO 2016 and the next as in CARO 2020, or the numbers are shifted). Ignore the printed "
++    "numbers and letters: map every passage by its SUBJECT to the CLAUSE MAP above. A managerial remuneration "
++    "passage (section 197 / Schedule V) answers no CARO 2020 unit.")
++
++
++def layout_recheck(caro_text: str, crosswalk_layout: Optional[str], order_year) -> tuple:
++    """(crosswalk_layout to use, reason or None). Never changes the Order, only how the numbers are read."""
++    if _is_2016(order_year):
++        return crosswalk_layout, None
++    from .edition import signals
++    sg = signals(caro_text or "")
++    cites = sorted({(a + b).lower() for a, b in _CITE_2020_SUB.findall(caro_text or "")})
++    n20 = len(sg.get("only_2020_topics") or [])
++    if crosswalk_layout in ("2016", "hybrid"):
++        if len(cites) >= 2:
++            return None, f"CARO 2020 layout: the report cites CARO 2020 sub-clauses {cites[:6]}"
++        if not sg.get("anchor_2016") and n20 >= 8:
++            return None, f"CARO 2020 layout: {n20} CARO 2020-only subjects and no CARO 2016 clause numbering"
++        return crosswalk_layout, None
++    if crosswalk_layout is None and sg.get("anchor_2016") and sg.get("anchor_2020"):
++        return "mixed", "printed numbers follow CARO 2016 for some clauses and CARO 2020 for others"
++    return crosswalk_layout, None
++
++
++def _subject_2016(successor: str, u2020: dict) -> tuple:
++    refs = re.findall(r"\([ivx]{1,5}\)(?:\([a-h]\))?(?:\([AB]\))?", successor or "")
++    hits = [u2020[r] for r in refs if r in u2020]
++    rx = "|".join(h.get("subject_words_regex") or "" for h in hits if h.get("subject_words_regex"))
++    nrx = (hits[0].get("not_subject_words_regex") or "") if len(hits) == 1 else ""
++    return rx, nrx
++
++
+ def catalogue_units(order_year) -> list:
+     """[{unit, ref, main, has_subs, question, not_confuse, subject_rx, not_rx}] in catalogue order
+     (CARO 2020: 21 + 39; CARO 2016: 16 + 8). Structure from caro_structure (the pipeline's own
+@@ -272,6 +414,13 @@
+     if _is_2016(order_year):
+         by = {u["unit_id_2016"]: {"q": u["official_question_or_subject"], "nc": ""}
+               for u in cm["caro_2016_units"]}
++        if _on("SUBJ_2016"):
++            u2020 = {u["ref"]: u for u in cm["caro_2020_units"]}
++            for u in cm["caro_2016_units"]:
++                rx, nrx = _subject_2016(u.get("caro_2020_successor"), u2020)
++                if u["unit_id_2016"] == "xi":
++                    rx, nrx = _XI_2016_RX, ""
++                by[u["unit_id_2016"]].update({"rx": rx, "nrx": nrx})
+     else:
+         by = {u["unit_id"]: {"q": _ROLLUP_PREFIX.sub("", u["official_question_or_subject"]),
+                              "nc": u.get("do_not_confuse_with") or "",
+@@ -312,6 +461,9 @@
+         for c in cm["crosswalk_2016_layout"]:
+             rule = f" ({c['rule']})" if c.get("rule") else ""
+             lines.append(f"  - printed {c['printed_in_report']} [{c['subject']}] -> {c['caro_2020_unit']}{rule}")
++    if crosswalk_layout == "mixed" and not _is_2016(order_year):
++        lines.append("")
++        lines.append(_MIXED_NUMBERING_NOTE)
+     lines.append("")
+     lines.append("MAPPING RULES:")
+     for r in cm["mapping_rules"]:
+@@ -542,7 +694,9 @@
+                        crosswalk_layout: Optional[str] = None) -> str:
+     c1, _c2, _d, _u = staged_rule_blocks(order_year, table_input=table_input,
+                                          crosswalk_layout=crosswalk_layout)
+-    job = _CALL1_JOB.replace("__STEP_A_CALL1__", _STEP_A_CALL1 if _on("STEP_A") else "")
++    job = _CALL1_JOB.replace("__STEP_A_CALL1__", (_STEP_A_CALL1 if _on("STEP_A") else "")
++                             + (_CALL1_AMOUNTS if _on("AMT_PROMPT") else "")
++                             + (_CALL1_ONE_UNIT if _on("ONE_UNIT") else ""))
+     return (CALL1_ROLE + "\n" + job.replace("__ORDER__", _order_label(order_year))
+             + "\n\n".join(c1) + "\n\n" + clause_map_block(order_year, crosswalk_layout))
+ 
+@@ -620,9 +774,9 @@
+ {_CALL1_SHAPE}"""
+ 
+ 
+-def _nf_schema() -> dict:
++def _nf_schema(limit: Optional[int] = None) -> dict:
+     return {"type": "object", "properties": {
+-        "source_text": {"type": "string"},
++        "source_text": ({"type": "string", "maxLength": int(limit)} if limit else {"type": "string"}),
+         "amount_items": {"type": "array", "items": {"type": "object", "properties": {
+             "as_printed": {"type": "string", "maxLength": 200}, "counts_toward_total": {"type": "boolean"},
+             "note": {"type": "string", "maxLength": 500}}, "required": ["as_printed"]}, "maxItems": 500},
+@@ -634,15 +788,44 @@
+         "required": ["source_text"]}
+ 
+ 
+-def call1_schema() -> dict:
++# PATCH 13-Oct-2026 (P13, Toby). WHY: K.R. Foods 2021-22 - Call 1 wrote the (ix) sentence 577 times inside (viii)'s
++# source_text (171,603 characters for a 7,826-character CARO text, 218 s) until the token limit. The rule "copy each
++# line once" cannot stop a loop the model does not notice. A field limit in the guided-JSON schema makes the server
++# close the field: limit = 6,000 characters (Toby, 13-Oct, checked with his script; the longest real field in the
++# 11/13-Oct replies is 5,234 characters). A field that reaches the limit is cut where it starts repeating; a long
++# field that is NOT repeating is asked once more with the limit raised by 20% (7,200; 2 attempts in all) and then
++# kept, logged for review.
++P13_LIMIT = 6000
++
++
++def source_limit(caro_text: str) -> Optional[int]:
++    return P13_LIMIT if _on("P13") else None
++
++
++def cut_runaway(text: str, caro_text: str) -> tuple:
++    """(text, cut?) - the field up to the first sentence it had already written (a loop), unless the filing itself
++    prints that sentence again at that point."""
++    parts = [p for p in re.split(r"(?<=[.;])\s+|\n+", text or "") if p.strip()]
++    seen, out = set(), []
++    src = re.sub(r"\s+", " ", caro_text or "").lower()
++    for p in parts:
++        k = re.sub(r"\s+", " ", p).strip().lower()
++        if len(k) >= 40 and k in seen and src.count(k) < 2:
++            return "\n".join(out), True
++        seen.add(k)
++        out.append(p)
++    return text, False
++
++
++def call1_schema(limit: Optional[int] = None) -> dict:
+     sub = {"type": "object", "properties": {
+         "sub_clause_id": {"type": "string"}, "sub_clause_ref": {"type": "string"},
+-        "evidence_text": {"type": "string", "maxLength": 1500}, "normalized_fields": _nf_schema()},
++        "evidence_text": {"type": "string", "maxLength": 1500}, "normalized_fields": _nf_schema(limit)},
+         "required": ["sub_clause_id", "evidence_text", "normalized_fields"]}
+     main = {"type": "object", "properties": {
+         "main_clause_id": {"type": "string"}, "main_clause_title": {"type": "string"},
+         "evidence_text": {"type": "string", "maxLength": 1500}, "order_year_mismatch": {"type": "boolean"},
+-        "normalized_fields": _nf_schema(), "sub_clauses": {"type": "array", "items": sub}},
++        "normalized_fields": _nf_schema(limit), "sub_clauses": {"type": "array", "items": sub}},
+         "required": ["main_clause_id", "evidence_text", "normalized_fields", "sub_clauses"]}
+     return {"title": CALL1_TITLE, "type": "object",
+             "properties": {"clauses": {"type": "array", "items": main}}, "required": ["clauses"]}
+@@ -790,11 +973,66 @@
+     extra = ((_CALL2_BATCH_RULES if (_on("F09") or _on("F16")) else "")
+              + (_CALL2_IX_2016 if (_on("F05") and _is_2016(order_year)) else "")
+              + (_CALL2_IX_EF if (_on("F34") and not _is_2016(order_year)) else "")
+-             + (_STEP_A_CALL2 if _on("STEP_A") else ""))
++             + (_STEP_A_CALL2 if _on("STEP_A") else "")
++             + (_CALL2_ONE_UNIT if _on("ONE_UNIT") else "")
++             + _call2_batch2(order_year))
+     return (CALL2_ROLE + "\n" + _CALL2_JOB.replace("__BATCH_CALL2__", extra).replace("__ORDER__", _order_label(order_year))
+             + "\n\n".join(c2) + "\n\n" + clause_map_block(order_year, crosswalk_layout))
+ 
+ 
++# PATCH 13-Oct-2026 (Option C, Toby): the label is decided on the unit's whole text (source_text), the quote
++# only shows where the deciding words are; "fits" is given only after every sentence was checked.
++_CALL2_ONE_UNIT = r"""
++WHOLE TEXT, OWN QUESTION:
++  - Before you answer "fits", read EVERY sentence of the unit's text against its own question. A
++    sentence that answers another unit is moved there (MAPPING CHECK), also when the auditor's
++    printed letter is this unit's; the rest is judged here.
++  - Classify on the WHOLE text that belongs to the unit (its text plus what was moved or assigned to
++    it), never on one sentence alone: an exception, a shortfall, a could-not-verify statement or a
++    listed default anywhere in that text decides the label. evidence_text only shows where the
++    deciding words are - copy the sentence that carries them.
++  - A "recheck" note that names another unit's question means the code found this unit's text on
++    that unit's subject: move the words there, or keep them and say in explanation_text which words
++    answer this unit's own question.
++"""
++
++
++# PATCH 13-Oct-2026 (evening batch). Prompt lines for Call 2, two-call flow only. WHY (13-Oct review):
++#   P2  WickedRide 2023-24/24-25 (xi)(b)/(c) "no fraud ... Hence reporting under 3(xi)(a) to (c) is not applicable"
++#       -> NA (CA Favourable); Viraj (xiv)(a) "internal audit system commensurate ... s.138 not applicable" -> NA.
++#       The (ix)(e)/(f) NA rule of 13-Oct was generalised by the model.
++#   P4  (iii)(a) qualified for terms / percentages / s.185-186 (Starlite 2021-22, Shri Dutt 2023-24, Western/Jsons
++#       2024-25).
++#   P15 (viii): plain denial = Favourable; denial + "not applicable" / "no comment" = NA (88 results already so).
++#   P18 Jaywant 2022-23 rights issue -> Favourable (CA NA); Jaywant 2021-22 / Committed allotment with no
++#       s.42/62 statement -> Favourable (CA Qualified).
++def _call2_batch2(order_year) -> str:
++    ed16 = _is_2016(order_year)
++    lines = []
++    if _on("P2") and not ed16:
++        lines.append("  - The (ix)(e) AND (ix)(f) not_applicable rule is ONLY for (ix)(e) and (ix)(f). For every other "
++                     "unit, LABEL VS. SUBSTANCE applies: a favourable finding followed by 'hence / accordingly ... not "
++                     "applicable' ('no fraud was noticed. Hence reporting under 3(xi)(a) to (c) is not applicable'; "
++                     "'has an internal audit system commensurate ... internal audit is not applicable as per section "
++                     "138') is clean. not_applicable needs the point itself not to arise for the company.")
++    if _on("P4") and not ed16:
++        lines.append("  - (iii)(a)(A) and (iii)(a)(B) ask ONLY the aggregate amount given during the year and the balance "
++                     "outstanding at the balance sheet date. A table or sentence that gives those amounts is clean. "
++                     "Terms, repayment schedule, overdue amounts, percentages and sections 185/186 are the questions of "
++                     "(iii)(b)-(f) and (iv) - never a reason to qualify (iii)(a). Loans stated as given but with no "
++                     "amount at all is an INCOMPLETE answer (qualified).")
++    if _on("P15") and not ed16:
++        lines.append("  - (viii): 'there are no transactions not recorded in the books that have been surrendered or "
++                     "disclosed as income' is clean; the same sentence followed by 'accordingly, the clause is not "
++                     "applicable' or 'no comment can be offered' is not_applicable.")
++    if _on("P18"):
++        lines.append("  - " + ("CARO 2016 (xiv)" if ed16 else "(x)(b)") + ": a rights issue alone is not a preferential "
++                     "allotment or private placement (not_applicable). An allotment or placement that the auditor "
++                     "reports without saying that sections 42 / 62 were complied with and the money was used for its "
++                     "purpose is an INCOMPLETE answer (qualified).")
++    return ("\nCLAUSE NOTES (13-Oct):\n" + "\n".join(lines) + "\n") if lines else ""
++
++
+ _CALL2_SHAPE = """\
+ Return ONLY this JSON object - one entry per main clause of STEP 1 RESULT, in the same order, with
+ every sub-clause listed there:
+@@ -1216,7 +1454,7 @@
+     return ("\n".join(out) if removed else text), removed
+ 
+ 
+-def _read_call1(obj: dict, cat: list, idx: dict, caro_text: str = "") -> tuple:
++def _read_call1(obj: dict, cat: list, idx: dict, caro_text: str = "", limit: Optional[int] = None) -> tuple:
+     """-> ({unit: data}, missing mains, missing subs)."""
+     got = {}
+     for rec in obj.get("clauses") or []:
+@@ -1231,6 +1469,10 @@
+                 sid = _canon(idx, s.get("sub_clause_id") or s.get("sub_clause_ref"))
+                 if sid and sid not in got and any(u["unit"] == sid and u["main"] == m for u in cat):
+                     got[sid] = _unit_data(s)
++    if limit:
++        for d in got.values():
++            if len(d.get("source") or "") >= limit - 2:
++                d["at_limit"] = True                     # PATCH 13-Oct-2026 (P13)
+     if caro_text:
+         for d in got.values():
+             d["source"], k = collapse_repeats(d["source"], caro_text)
+@@ -1430,7 +1672,17 @@
+             src = units.get(uid) or _empty_unit()
+             here = src["source"] or src["evidence"]
+             entry = {"from": uid, "to": mv["to"], "text": mv["text"][:200]}
+-            if not _contains(here, mv["text"]):
++            mpass = (units.get(by[uid]["main"]) or {}).get("source") or "" if uid in by and by[uid]["main"] != uid else ""
++            if (not _contains(here, mv["text"]) and _on("MOVE_PASSAGE") and mpass and _contains(mpass, mv["text"])
++                    and not mv["to"].startswith("?") and mv["to"] in by):
++                # PATCH 13-Oct-2026 (MOVE_PASSAGE): the words are in this unit's clause passage (the model read
++                # them as "(same as passage)" text) - they go to the unit they answer; nothing is removed
++                if mv["to"] == by[uid]["main"]:
++                    entry["result"] = "ignored: already in the clause passage"
++                else:
++                    give(mv["to"], mv["text"], None)
++                    entry["result"] = "placed from the clause passage"
++            elif not _contains(here, mv["text"]):
+                 entry["result"] = "rejected: words not in this unit's text"
+             elif mv["to"].startswith("?"):
+                 entry["result"] = "rejected: unknown unit"
+@@ -1819,6 +2071,33 @@
+     return "\n".join(ln for ln in lines[hit[0]:end] if ln.strip())
+ 
+ 
++# PATCH 13-Oct-2026 (TABLE_QUOTE). WHY: WickedRide 2022-23 (iii)(a)(A) - the model judged the loans table
++# correctly but wrote "(Guarantees)", "(Loans)" into its quote; the quote was not in the filing, the evidence
++# check withdrew the verdict (Not Reported). When every figure of the quote is in the unit's own text, the
++# quote becomes the auditor's own lines that hold those figures (with the line that introduces the table).
++_QFIG = re.compile(r"\d[\d,]*\.\d+|\d{1,3}(?:,\d{2,3})+|\d{3,}")
++
++
++def _table_block(own: str, quote: str) -> Optional[str]:
++    figs = _QFIG.findall(quote or "")
++    if len(figs) < 2 or not own:
++        return None
++    lines = own.split("\n")
++    pos = []
++    for f in figs:
++        hit = next((i for i, ln in enumerate(lines) if f in ln), None)
++        if hit is None:
++            return None
++        pos.append(hit)
++    a, b = min(pos), max(pos)
++    if b - a > 40:
++        return None
++    while a > 0 and not re.search(r"[A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){3,}", lines[a]) and a > min(pos) - 12:
++        a -= 1                                       # back to the sentence / header that introduces the rows
++    blk = "\n".join(x for x in lines[a:b + 1] if x.strip())
++    return blk if _contains(own, blk) else None
++
++
+ def settle_text(units: dict, ans: dict, by: dict, notes: dict) -> None:
+     log = notes.setdefault("text_settled", [])
+     for uid, u in by.items():
+@@ -1843,6 +2122,13 @@
+                 log.append({"unit": uid, "action": "text taken from the clause passage", "text": take[:160]})
+                 continue
+         line = _best_line(own, quote) or (_best_line(main_src, quote) if main_src else "")
++        if not line and _on("TABLE_QUOTE"):
++            blk = _table_block(own, quote)
++            if blk:
++                a["evidence"] = blk
++                log.append({"unit": uid, "action": "table quote replaced by the auditor's own lines",
++                            "was": quote[:120], "now": blk[:120]})
++                continue
+         if line:
+             fixed = " ".join(line.split()[:40])
+             if _contains(line, fixed):
+@@ -1956,6 +2242,126 @@
+     r"(?:raised|taken|obtained)|\bnot (?:raised|taken) any\b", re.I)
+ 
+ 
++# PATCH 13-Oct-2026 (mapping, F35). WHY: F14 checks only quotes borrowed from the clause passage; nothing
++# checked the text Call 1 placed on the unit itself (13-Oct review P3, 17 units). A unit whose OWN text has
++# none of its subject words (clause map M10) and does have another unit's subject words (M11), or that holds
++# only the printed CARO question, gets ONE recheck note naming both questions. The model decides; code never
++# moves the words or sets the label.
++_Q_TAIL = re.compile(r"if so,?\s+(?:specify|provide|state|whether)|if yes,?\s+(?:then|the|whether)|if not,?\s+(?:the|provide|whether)"
++                     r"|shall be (?:indicated|stated|reported)|provide the details thereof|must be mentioned|"
++                     r"(?:has|have) been (?:obtained|stated|indicated)\s*[.?]?\s*$", re.I)
++# wording the clause map's subject words miss, seen on correct answers in the 11/13-Oct runs (F35 only)
++_F35_MORE = {"xi_b": r"section\s*143|sub-?section\s*\(\s*12\s*\)", "iii_f": r"on\s+demand",
++             "ix_a": r"\bborrowings?\b|\blenders?\b|\bbanks?\b", "viii": r"\bborrowings?\b|\blenders?\b|\bbanks?\b",
++             "i_b": r"verified|verification", "iv": r"loans? to directors|section\s*18[56]|sec\.?\s*18[56]",
++             "xxi": r"group compan|qualifications? or adverse|adverse remarks",
++             "iii_a_A": r"balance outstanding|aggregate amount|subsidiar|joint venture|associate",
++             "iii_a_B": r"balance outstanding|aggregate amount|other(?:s|\s+part)|employees"}
++_SHORT_NA = re.compile(r"not\s+applicable|\bnil\b|\bn\.?\s?a\.?\b|does\s+not\s+arise|not\s+required|no\s+such", re.I)
++
++
++def own_subject_check(uid: str, u: dict, own: str, main_src: str, by: dict) -> Optional[tuple]:
++    """(reason, [other units]) when the unit's own text is on another unit's subject, else None."""
++    body = _MCA_LABEL_RX.sub(" ", own or "")
++    if not _real(body) or not u.get("subject_rx"):
++        return None
++    if main_src and _norm_txt(body) == _norm_txt(main_src):
++        return None                                  # the whole clause passage / a blanket statement
++    sents = [s for p in re.split(r"…|\.{3}", body) for s in _sentences(p) if len(s.strip()) > 3]
++
++    def _after_question(s: str) -> str:
++        cut = [m.end() for m in _Q_TAIL.finditer(s)]
++        return s[cut[-1]:] if cut else ("" if (_PRINTED_Q.search(s) or re.search(r"\?\s*$", s)) else s)
++    answer = [s for s in sents if len(_after_question(s).split()) >= 4 or _SHORT_NA.search(_after_question(s))
++              or re.fullmatch(r"\W*(?:yes|no|none|nil)\W*", _after_question(s), re.I)]
++    if sents and not answer:
++        return ("only the printed CARO question, no answer", [])
++    if _on("P11") and re.match(r"^\W*as\s+(?:mentioned|stated|given|reported|disclosed)\s+(?:in|under)\s+(?:the\s+|our\s+)?"
++                               r"(?:independent\s+)?(?:audit(?:or'?s)?|main)\s+report\W*$", body.strip(), re.I):
++        return ("only a pointer to another report ('" + body.strip()[:60] + "'), not an answer", [])
++    text = " ".join(answer) or body
++    nil = bool(_SHORT_NA.search(text) or _NIL_RE.search(text))   # an NA / nil answer: may be a blanket (M4, M5)
++    if _rx_hit(u["subject_rx"], text) or _rx_hit(_F35_MORE.get(uid, ""), text):
++        return None
++    main = u["main"]
++    on_main = main != uid and _rx_hit(_main_rx(by, main), text)
++    others = []
++    for k, v in by.items():
++        if k == uid or v["has_subs"] or not v.get("subject_rx") or k == main:
++            continue
++        if on_main and v["main"] != main:
++            continue                                 # on this clause's subject: only a sibling can be meant
++        if nil and v["main"] == main:
++            continue                                 # a nil answer naming a sibling's words is a blanket
++        words = {m.group(0).lower() for m in re.finditer(v["subject_rx"], text, re.I)} if _rx_hit(v["subject_rx"], text) else set()
++        if nil:
++            words = {w for w in words if not _SJA.fullmatch(w) and not re.match(r"subsidiar|associat|joint", w)}
++        if words and not _rx_hit(v.get("not_rx"), text):
++            others.append((len(words), k))
++    if not others:
++        return None
++    others.sort(key=lambda x: -x[0])
++    return ("none of this unit's subject words, but the subject words of another unit", [k for _h, k in others[:2]])
++
++
++# PATCH 13-Oct-2026 (evening batch) - notices for the ONE recheck. Code only notices; the model decides.
++_DISPUTE_DENIAL = re.compile(r"\b(?:no|nil|none|not\s+any|there\s+(?:are|were|is|was)\s+no)\b[^.]{0,160}?(?<!un)disput"
++                             r"|(?<!un)disput\w*[^.]{0,60}\b(?:nil|none|not\s+applicable)\b"
++                             r"|not\s+been\s+deposited\s+(?:on\s+account\s+of|due\s+to)\s+any\s+dispute", re.I)
++_POINTER = re.compile(r"except\s+(?:as\s+|for\s+(?:those\s+)?|what\s+is\s+)?(?:given|stated|mentioned|reported|"
++                      r"disclosed|detailed|listed)\s+(?:in|under|at)\s+(?:the\s+)?(?:para(?:graph)?|clause|point|note)?"
++                      r"\s*\(?\s*([a-h]|[ivx]{1,5})\s*\)", re.I)
++_ANNOUNCE = re.compile(r"(?:\bas\s+under|\bas\s+follows|\bthe\s+following|\bgiven\s+below|\bas\s+below|\bmentioned\s+below|"
++                       r"\bdetailed\s+below)\s*[:\-–]?\s*$|(?:following|particulars|details)[^.]{0,60}:\s*$", re.I)
++_ARREARS_LISTED = re.compile(r"(?:arrears|outstanding|payable)[^.;]{0,200}?(?:more\s+than|exceeding)\s+(?:six|6)\s+months", re.I)
++_NO_ARREARS = re.compile(r"\bno\s+(?:\w+\s+){0,6}?(?:arrears|amounts?\s+payable|undisputed)|\bnil\b|were\s+not\s+outstanding"
++                         r"|there\s+(?:are|were)\s+no\b", re.I)
++_IA_NOT_DONE = re.compile(r"internal\s+audit[^.]{0,120}\b(?:not\s+(?:been\s+)?(?:conducted|carried\s+out|done|performed|"
++                          r"appointed)|no\s+internal\s+audit(?:or)?\s+(?:was|has|had)?)|\bno\s+internal\s+audit(?:or)?\b"
++                          r"[^.]{0,80}\b(?:appointed|conducted|carried)", re.I)
++_IA_NOT_REQUIRED = re.compile(r"not\s+(?:applicable|required|mandatory)|\b138\b[^.]{0,60}\bnot\b", re.I)
++_MODEL_SAYS_INCOMPLETE = re.compile(r"\bincomplete\b|\bdangling\b|does\s+not\s+(?:state|specify|give|provide|mention|"
++                                    r"disclose)|not\s+(?:stated|specified|disclosed|given)\b|\bmissing\b|"
++                                    r"\bno\s+(?:figures|amounts?|details|particulars)\b", re.I)
++_GUESS_WORDS = re.compile(r"\bimpl(?:y|ies|ying|ied)\b|\bpresumabl\w*|\bby\s+default\b|\bit\s+can\s+be\s+inferred\b|"
++                          r"\binferr?(?:ed|ing)\b|\bassum(?:e|ed|ing|ption)\b", re.I)
++_P2_UNITS = {"ix_a", "ix_b", "ix_c", "ix_d", "xi_a", "xi_b", "xi_c", "xiv_a", "xv"}
++# the other P2 units are "always arising" units: post_rules' NA/clean table turns their NA into Favourable when the
++# unit's own text states the finding (P2 there), so only these two get a note
++_P2_NOTE_UNITS = {"ix_c", "xiv_a"}
++_P2_FAV = re.compile(r"\bno\s+(?:material\s+)?fraud|not\s+(?:been\s+)?(?:noticed|reported)|has\s+not\s+defaulted|"
++                     r"no\s+default|internal\s+audit\s+system\s+commensurate|commensurate\s+with|"
++                     r"applied\s+for\s+the\s+purpose|not\s+been\s+declared|no\s+whistle|not\s+entered\s+into\s+any\s+non", re.I)
++_P2_NOT_ARISE = re.compile(r"(?:does|did)\s+not\s+have\s+any|has\s+no\s+(?:borrowings|loans|subsidiar)|not\s+(?:availed|taken|"
++                           r"obtained|raised)\s+any|no\s+(?:borrowings|term\s+loans?)\b", re.I)
++
++
++def _para_block(passage: str, letter: str, cap: int = 900) -> Optional[str]:
++    """The paragraph printed under '(b)' / 'b)' in a clause passage, up to the next marker."""
++    m = re.search(r"(?m)^[ \t]*\(?\s*" + re.escape(letter) + r"\s*\)[ \t]*", passage or "", re.I)
++    if not m:
++        return None
++    rest = passage[m.end():]
++    nx = re.search(r"(?m)^[ \t]*\(?\s*(?:[a-h]|[ivx]{1,5})\s*\)[ \t]*(?:\S|$)", rest)
++    blk = rest[:nx.start()] if nx else rest
++    blk = blk.strip()
++    return blk[:cap] if len(blk) > 25 else None
++
++
++def _dispute_text(main_src: str, held: str) -> Optional[str]:
++    """P1: a sentence / table on DISPUTED dues in the (vii) passage that no sub-clause holds (denials excluded)."""
++    t = main_src or ""
++    for m in re.finditer(r"[^.\n]*(?<!un)disput[^.\n]*(?:[.\n]|$)", t, re.I):
++        sent = m.group(0).strip()
++        if len(sent) < 25 or _DISPUTE_DENIAL.search(sent) or _PRINTED_Q.search(sent):
++            continue
++        if _norm_txt(sent)[:60] and _norm_txt(sent)[:60] in held:
++            continue
++        tail = t[m.end():m.end() + 400]
++        return (sent + ("\n" + tail.strip() if _DISPUTE_WORDS.search(tail) or re.search(r"\d", tail) else ""))[:700]
++    return None
++
++
+ def batch_notices(ans: dict, units: dict, by: dict, order_year, *, final: bool, notes: dict) -> tuple:
+     """First pass: ({unit: note}, {unit: set(fix)}, {extra mains to show in the recheck}).
+     Final pass: logs what the model did with each note (never changes a label), and returns the
+@@ -2028,6 +2434,97 @@
+                 note(uid, "F34", "this text says the company has no subsidiaries, joint ventures or associates, or "
+                      "that the clause does not apply. Under the (ix)(e) AND (ix)(f) rule that is not_applicable, not "
+                      "clean. Read it again and keep clean only if the text does not say that")
++        # ---- P1 (vii)(b) has no dispute text; the (vii) paragraph has one (TRIAL) ------------------
++        if _on("P1") and uid == "vii_b" and cls in (None, "clean", "not_applicable", "insufficient_evidence") \
++                and not _DISPUTE_WORDS.search(_DISPUTE_DENIAL.sub(" ", own or "")) and main_src:
++            held = " ".join(_norm_txt((units.get(k) or {}).get("source") or "")
++                            for k, v in by.items() if v["main"] == main and k not in (uid, main))
++            blk = _dispute_text(main_src, held)
++            if blk:
++                note(uid, "P1", "this unit's text says nothing on DISPUTED dues, but the (" + main + ") paragraph has this "
++                     "text on dues pending in a dispute that no sub-clause holds: '" + blk[:500] + "'. If it answers this "
++                     "unit's question ('" + u["question"][:120] + "'), move it to " + uid + " and judge " + uid + " on it "
++                     "(quote the sentence and the table row); if it does not, keep your answer and say why",
++                     block=blk[:300])
++        # ---- P16 "except as given in Para (b) below" - the paragraph it points to (TRIAL) ----------
++        if _on("P16") and cls is not None and own:
++            pm = _POINTER.search(own) or _POINTER.search(a.get("evidence") or "")
++            if pm:
++                passage = main_src or (units.get(main) or {}).get("source") or own
++                blk = _para_block(passage, pm.group(1).lower())
++                if blk and not _contains(own, blk[:120]):
++                    note(uid, "P16", "this unit's text says '" + pm.group(0)[:80] + "'. The paragraph it points to, in "
++                         "the same clause, reads: '" + blk[:500] + "'. If that paragraph is on this unit's subject, it is "
++                         "part of this unit's answer - judge this unit on both (move the words here); if it is on "
++                         "another unit's subject, judge this unit on its own words only", block=blk[:300])
++        # ---- P2 favourable finding + "hence not applicable" outside (ix)(e)/(f) --------------------
++        if _on("P2") and not _is_2016(order_year) and uid in _P2_NOTE_UNITS and cls == "not_applicable" and own:
++            fav = _P2_FAV.search(own)
++            if fav and not _P2_NOT_ARISE.search(own):
++                note(uid, "P2", "this text states a finding ('" + own[max(0, fav.start() - 40):fav.end() + 40].strip()
++                     + "') and then says the clause is not applicable. The (ix)(e)/(ix)(f) not_applicable rule does not "
++                     "apply to this unit: under LABEL VS. SUBSTANCE a stated favourable finding is clean. Keep "
++                     "not_applicable only if the text says the point does not arise for the company")
++        # ---- P7B particulars announced but not given (TRIAL) ----------------------------------
++        if _on("P7B") and cls in ("clean", "not_applicable") and own:
++            for s in [x.strip() for x in re.split(r"\n+", own) if x.strip()]:
++                if _ANNOUNCE.search(s) and len(s) > 25:
++                    after = own[own.find(s) + len(s):]
++                    if len(re.findall(r"[A-Za-z]{2,}|\d+", after)) < 6:
++                        note(uid, "P7B", "this text announces particulars ('" + s[-160:] + "') but no particulars follow "
++                             "in it. If the auditor's answer really stops there, it is an INCOMPLETE / DANGLING "
++                             "DISCLOSURE (qualified); if the particulars are printed elsewhere for this unit, judge on them")
++                        break
++        # ---- P7C (vii)(a) answered while arrears > 6 months are listed (TRIAL) ---------------------
++        if _on("P7C") and uid == "vii_a" and cls in ("clean", "qualified") and own:
++            for s in _sentences(own):
++                if _ARREARS_LISTED.search(s) and not _NO_ARREARS.search(s):
++                    tail = own[own.find(s) + len(s):][:400]
++                    from .post_rules import R_ARREARS, R_ARREARS_EXCEPT
++                    if R_ARREARS.hit(own) or R_ARREARS_EXCEPT.hit(own):
++                        break                            # the existing adverse trigger already reads this text
++                    if re.search(r"\d{3,}|\d+\.\d+", s + tail):
++                        note(uid, "P7C", "this unit's own text lists undisputed dues in arrears for more than six "
++                             "months: '" + s[:220] + "'. Read it under the STATUTORY ARREARS rule (arrears listed = "
++                             "adverse) and decide on the auditor's words")
++                        break
++        # ---- P7D (xiv)(a) internal audit required but not carried out (TRIAL) -------------------
++        if _on("P7D") and uid in ("xiv_a", "xiv") and not _is_2016(order_year) and cls in ("clean", "not_applicable") \
++                and own and _IA_NOT_DONE.search(own) and not _IA_NOT_REQUIRED.search(own):
++            note(uid, "P7D", "this text says the internal audit was not carried out: '"
++                 + own[max(0, _IA_NOT_DONE.search(own).start() - 40):_IA_NOT_DONE.search(own).end() + 40].strip()
++                 + "' and does not say it is not required. Read it again: an internal audit the company needs but did "
++                 "not have is not a clean answer")
++        # ---- P7E "insufficient" although the model calls the answer incomplete (TRIAL) -----------
++        if _on("P7E") and cls == "insufficient_evidence" and _real(own) and not _PRINTED_Q.search(own.strip()) \
++                and _MODEL_SAYS_INCOMPLETE.search(a.get("explanation") or ""):
++            note(uid, "P7E", "your explanation says the auditor's answer is incomplete ('" + (a.get("explanation") or "")[:160]
++                 + "'), but the label is insufficient_evidence. insufficient_evidence is ONLY for no answer at all; an "
++                 "answer on this unit's subject that does not state the outcome or the particulars is an INCOMPLETE / "
++                 "DANGLING DISCLOSURE (qualified, basis incomplete). Decide on the auditor's words")
++        # ---- P8 explanation that guesses ---------------------------------------------------------
++        if _on("P8") and cls in ("clean", "not_applicable") and _GUESS_WORDS.search(a.get("explanation") or ""):
++            g = _GUESS_WORDS.search(a.get("explanation") or "")
++            note(uid, "P8", "your explanation infers something the auditor did not write ('" + g.group(0) + "'). Judge "
++                 "only what the auditor wrote: if the text does not state the fact, say what is missing (an INCOMPLETE "
++                 "answer, or no answer) - never implied, assumed, presumably or by default")
++        # ---- F35 the unit's OWN text is on another unit's subject (13-Oct mapping) --------------
++        if _on("F35") and cls is not None and own and uid in by:
++            chk = own_subject_check(uid, u, own, main_src, by)
++            if chk:
++                why, others = chk
++                if others:
++                    for o in others:
++                        extra_mains.add(by[o]["main"])
++                    oq = "; ".join(f"({o}) '{by[o]['question'][:110]}'" for o in others)
++                    note(uid, "F35", "the text placed on this unit has " + why + ": " + oq + ". This unit's own "
++                         "question is: '" + u["question"][:140] + "'. Read the text again: move the words to the unit "
++                         "they answer; keep them here only if they answer this unit's own question (say which words "
++                         "do in explanation_text). If nothing is left that answers this unit, it has no answer",
++                         others=",".join(others))
++                else:
++                    note(uid, "F35", "the text placed on this unit is " + why + ". That is not an answer: judge this "
++                         "unit only on an answer the auditor wrote (if there is none, it has no answer)")
+         # ---- F14 a verdict that quotes another clause's words ------------------------------
+         q = a.get("evidence") or ""
+         if (_on("F14") and cls not in (None, "insufficient_evidence") and _real(q) and main_src
+@@ -2074,7 +2571,9 @@
+                     note(uid, "F16", "your (iii)(a)(B) quote names '" + hit + "' as the party. (iii)(a)(B) is only "
+                          "parties OTHER than subsidiaries, joint ventures and associates; loans to subsidiaries, joint "
+                          "ventures or associates are (iii)(a)(A). Check the party and move the words to iii_a_A if "
+-                         "they belong there", words=hit)
++                         "they belong there" + (". Move ONLY the words that name subsidiaries, joint ventures or "
++                         "associates; a sentence about other parties or a denial ('other than the above, no loans were "
++                         "given') stays on this unit and is judged here" if _on("P6") else ""), words=hit)
+             elif not _names_sja(q) and not _names_sja(main_src or own) and not _SJA_CONCERN.search(q):
+                 note(uid, "F16", "your (iii)(a)(A) quote names no subsidiary, joint venture or associate. (iii)(a)(A) "
+                      "is ONLY those parties; a holding company, directors, related parties, group companies and "
+@@ -2244,14 +2743,21 @@
+     r"|\b(?:cannot|can\s*not|could\s*not)\s+be\s+(?:checked|verified|ascertained|examined)\b[^.;]{0,60}?"
+     r"\b(?:records?|documents?|information|provide|produced|given|available)"
+     r"|\b(?:difficult|not\s+possible|impossible)\s+(?:for\s+us\s+)?to\s+(?:comment|verify|ascertain)\b")
++# PATCH 13-Oct-2026 (P11): Prasad 2020-21 (ii) "records ... are not provided by the management ... we are unable to
++# say" (CA Auditor Unable to Verify) was rejected as a scope limitation.
++_SCOPE_MEANING_P11 = (r"|\bnot\s+(?:been\s+)?(?:provided|produced|furnished)\s+by\s+the\s+management\b[^.;]{0,160}?"
++                      r"\bunable\s+to\s+(?:say|comment|verify|ascertain|confirm)")
+ _SCOPE_MEANING_ON = re.compile(_SCOPE_MEANING_BASE + _SCOPE_MEANING_F13, re.I)
++_SCOPE_MEANING_ON_P11 = re.compile(_SCOPE_MEANING_BASE + _SCOPE_MEANING_F13 + _SCOPE_MEANING_P11, re.I)
+ _SCOPE_MEANING_OFF = re.compile(_SCOPE_MEANING_BASE, re.I)
+ 
+ 
+ class _ScopeMeaning:
+     """PATCH 13-Oct-2026 (Phase 2): the F13 wordings follow PATCH_SWITCHES["F13"] (rollback switch)."""
+     def search(self, text):
+-        return (_SCOPE_MEANING_ON if _on("F13") else _SCOPE_MEANING_OFF).search(text)
++        if _on("F13"):
++            return (_SCOPE_MEANING_ON_P11 if _on("P11") else _SCOPE_MEANING_ON).search(text)
++        return _SCOPE_MEANING_OFF.search(text)
+ 
+ 
+ _SCOPE_MEANING = _ScopeMeaning()
+@@ -2321,6 +2827,9 @@
+     if still_other and uid in still_other:
+         rec.setdefault("review_reasons", []).append("verdict_quotes_another_clause")
+     fixes = ((notes or {}).get("patch_units") or {}).get(uid)
++    trial = sorted(set(fixes or []) & TRIAL_FIXES)
++    if trial:
++        rec.setdefault("review_reasons", []).append("trial:" + ",".join(trial))   # PATCH 13-Oct-2026: trial fixes
+     if fixes:
+         rec.setdefault("staged_trace", {})["patch_fixes"] = list(fixes)
+         if llm_flow() == "staged_nofallback":
+@@ -2382,22 +2891,50 @@
+     cat = catalogue_units(order_year)
+     idx = _id_index(cat)
+     by = {u["unit"]: u for u in cat}
++    if _on("XWALK_LAYOUT") and not table_input:
++        _cw, _why = layout_recheck(caro_text, crosswalk_layout, order_year)
++        if _why:
++            n["layout_check"] = {"was": crosswalk_layout, "now": _cw, "why": _why}
++            if crosswalk_layout in ("2016", "hybrid") and _cw is None:
++                ictx["crosswalk_off"] = True          # pipeline: no CARO 2016-layout subject guard either
++            crosswalk_layout = _cw
+ 
+     # ---- CALL 1: extract and map --------------------------------------------------------
+     sys1 = build_call1_system(order_year, table_input=table_input, crosswalk_layout=crosswalk_layout)
+     n1 = n.setdefault("call1", {})
++    lim = source_limit(caro_text)
+     obj1 = _ask(client, 1, sys1, build_call1_user(caro_text, company, fy, order_year, table_input=table_input),
+-                call1_schema(), _dump, n1, "main")
+-    units, miss_m, miss_s = _read_call1(obj1, cat, idx, caro_text)
+-    if miss_m or miss_s:
+-        n1["missing_first_reply"] = {"mains": miss_m, "subs": miss_s}
+-        ask_mains = sorted(set(miss_m) | {by[s]["main"] for s in miss_s}, key=lambda x: _seq.index(x))
++                call1_schema(lim), _dump, n1, "main")
++    units, miss_m, miss_s = _read_call1(obj1, cat, idx, caro_text, limit=lim)
++    # PATCH 13-Oct-2026 (P13): a field that reached the limit - a loop is cut where it starts repeating; a long
++    # field that does not repeat is asked once more (+20%) in the follow-up below
++    long_mains = []
++    for uid_, d_ in list(units.items()):
++        if not d_.pop("at_limit", False):
++            continue
++        cut, did = cut_runaway(d_["source"], caro_text)
++        if did:
++            d_["source"] = cut
++            n1.setdefault("p13_runaway_cut", []).append(uid_)
++            _trace(n, "P13", "runaway field cut at the first repeated sentence", uid_)
++        elif uid_ in by and by[uid_]["main"] not in long_mains:
++            long_mains.append(by[uid_]["main"])
++    if long_mains:
++        n1["p13_long_field_reask"] = long_mains
++    if miss_m or miss_s or long_mains:
++        if miss_m or miss_s:
++            n1["missing_first_reply"] = {"mains": miss_m, "subs": miss_s}
++        ask_mains = sorted(set(miss_m) | {by[s]["main"] for s in miss_s} | set(long_mains), key=lambda x: _seq.index(x))
++        lim2 = int(lim * 1.2) if (lim and long_mains) else lim
+         obj1b = _ask(client, 1, sys1, build_call1_user(caro_text, company, fy, order_year, table_input=table_input,
+                                                        only_mains=ask_mains),
+-                     call1_schema(), _dump, n1, "reask")
+-        more, _mm, _ms = _read_call1(obj1b, cat, idx, caro_text)
++                     call1_schema(lim2), _dump, n1, "reask")
++        more, _mm, _ms = _read_call1(obj1b, cat, idx, caro_text, limit=lim2)
+         for k, v in more.items():
+-            if k not in units:
++            if k not in units or (k in by and by[k]["main"] in long_mains):
++                if v.pop("at_limit", False):             # second attempt also at the limit: kept, for review
++                    v["source"], _c = cut_runaway(v["source"], caro_text)
++                    _trace(n, "P13", "field still at the limit after the second attempt - kept, review", k)
+                 units[k] = v
+         miss_m = [m for m in miss_m if m not in units]
+         if miss_m:
+@@ -2475,11 +3012,22 @@
+             # (verified word for word by apply_moves, as every move), and the unit that receives the
+             # words takes the model's answer from the same recheck.
+             mv = {u: more[u] for u in recheck if more.get(u) and more[u].get("moves")
+-                  and b_tags.get(u, set()) & {"F10", "F14", "F16"}}
++                  and b_tags.get(u, set()) & {"F10", "F14", "F16", "F35", "P1", "P16"}}
+             if mv:
++                _before = {t: (units.get(t) or {}).get("source") or "" for a_ in mv.values() for t in
++                           [m["to"] for m in a_["moves"]]}
+                 apply_moves(units, mv, [], unplaced, caro_text, cat, n)
+                 for t in {m["to"] for a_ in mv.values() for m in a_["moves"]}:
+                     if t in by and t not in recheck and more.get(t) and more[t].get("classification"):
++                        # PATCH 13-Oct-2026 (P5). WHY: Shri Dutt 2024-25 (iii)(a)(A) took the recheck's answer
++                        # (Favourable -> Qualified, same explanation) although no words reached it. A unit that
++                        # carried no note takes the recheck answer only when the moved words changed its text.
++                        # (log only: the replay showed the recheck answer is also right - Jsons 2023-24 (iii)(a)(B))
++                        if _on("P5") and ((units.get(t) or {}).get("source") or "") == _before.get(t, "") \
++                                and more[t].get("classification") != (ans.get(t) or {}).get("classification"):
++                            _trace(n, "P5", "label changed by the recheck although no words reached the unit - review",
++                                   t, first=(ans.get(t) or {}).get("classification") or "",
++                                   recheck=more[t].get("classification") or "")
+                         ans[t] = dict(more[t], moves=[])
+                         _trace(n, "MOVE", "unit answered with the words moved to it", t)
+         except StageError as e:                                       # the first answers + final guard stand
+--- a/caro/post_rules.py
++++ b/caro/post_rules.py
+@@ -449,7 +449,16 @@
+ def points_to_attachment(rec: dict) -> bool:
+     nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+     txt = " ".join(t for t in (real_text(rec.get("evidence_text")), real_text(nf.get("source_text"))) if t)
+-    return bool(txt) and bool(ATTACHMENT_POINTER_RE.search(txt)) and len(strip_labels(txt)) < 200
++    if bool(txt) and bool(ATTACHMENT_POINTER_RE.search(txt)) and len(strip_labels(txt)) < 200:
++        return True
++    # PATCH 13-Oct-2026 (P11, two-call records only): a box that holds only "As mentioned in the Audit report"
++    # (Sahyadri 2024-25 (x)(b)) points to a text that is not in the input -> Not Available in Source
++    return bool(rec.get("_staged") and _patch_on("P11") and txt and len(strip_labels(txt)) < 120
++                and _REPORT_POINTER_RE.match(strip_labels(txt)))
++
++
++_REPORT_POINTER_RE = re.compile(r"^\W*as\s+(?:mentioned|stated|given|reported|disclosed)\s+(?:in|under)\s+(?:the\s+|our\s+)?"
++                                r"(?:independent\s+)?(?:audit(?:or'?s)?|main)\s+report\W*$", re.I)
+ 
+ 
+ def source_cannot_contain(main_id: str, order_year, text_source_kind, uncovered=None) -> bool:
+@@ -652,6 +661,15 @@
+                       r"\bnot applicable\b|\bno unspent\b|\bnil\b|\bno amount\b",
+                       description="Unspent CSR not transferred / transferred late")
+ R_CSR_UNSPENT.pkg13 = True
++# PATCH 13-Oct-2026 (P7A, TRIAL, two-call records only). WHY: Universal Contractors 2021-22 / 2022-23 (xx): "the
++# provision of section 135 are applicable on the company but has not been complied with" -> Qualified (CA Adverse,
++# red flag lost). Corpus check (11-Oct + 13-Oct texts): the pattern occurs only in these two filings.
++R_CSR_NONCOMPLY = _Rule("ADV_CSR_NOT_COMPLIED",
++                        r"\b135\b[^.]{0,120}\b(?:has|have|had)\s+not\s+been\s+complied|"
++                        r"not\s+(?:been\s+)?complied\s+with[^.]{0,80}\b135\b|non[- ]compliance[^.]{0,60}\b135\b",
++                        r"\bno\s+unspent\b|\bnot\s+applicable\b|\bduly\s+complied\b",
++                        description="CSR obligation under section 135 not complied with")
++R_CSR_NONCOMPLY.staged_patch = "P7A"
+ R_TITLE = _Rule("ADV_TITLE_NOT_IN_NAME",
+                 r"not (?:held )?in the name of the company|"
+                 r"title deeds?[^.]{0,80}(?:not|yet to be) (?:been )?(?:registered|transferred|executed) in the name",
+@@ -677,7 +695,8 @@
+         "ix": [R_DEFAULT, R_WILFUL, R_PURPOSE, R_ST_LT],
+         "xi_a": [R_FRAUD], "xi": [R_FRAUD],
+         "xvii": [R_CASH_LOSS], "xix": [R_GOING_CONCERN],
+-        "xx_a": [R_CSR, R_CSR_UNSPENT], "xx_b": [R_CSR, R_CSR_UNSPENT], "xx": [R_CSR, R_CSR_UNSPENT],
++        "xx_a": [R_CSR, R_CSR_UNSPENT, R_CSR_NONCOMPLY], "xx_b": [R_CSR, R_CSR_UNSPENT, R_CSR_NONCOMPLY],
++        "xx": [R_CSR, R_CSR_UNSPENT, R_CSR_NONCOMPLY],
+     },
+     2016: {
+         "i_c": [R_TITLE], "i": [R_TITLE],
+@@ -852,7 +871,9 @@
+                 continue
+             uid = _unit_id(rec, level, main_id)
+             rules = [x for x in (table.get(uid) or []) if (wide or not getattr(x, "pkg13", False))
+-                     and (csr_rpt_rules_on() or not getattr(x, "csr_rpt", False))]
++                     and (csr_rpt_rules_on() or not getattr(x, "csr_rpt", False))
++                     and (not getattr(x, "staged_patch", None)
++                          or (rec.get("_staged") and _patch_on(x.staged_patch)))]
+             if not rules:
+                 continue
+             nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
+@@ -900,6 +921,8 @@
+                         rr.remove("verdict_without_evidence")
+                     rec["escalated_from_ungraded_quote"] = True
+                 _escalate(rec, rule, sent, red_flag_clauses, main_id)
++                if getattr(rule, "staged_patch", None):
++                    _add_reason(rec, "trial:" + rule.staged_patch)       # PATCH 13-Oct-2026: trial fix
+                 if from_window:
+                     rec["trigger_read_clause_text"] = True
+                 done.append((uid, rule.rid + ("@clause_text" if from_window else "")))
+@@ -1281,6 +1304,97 @@
+           2016: {k: re.compile(v, re.I) for k, v in _NA_PHRASES_2016.items()}}
+ 
+ 
++# PATCH 13-Oct-2026 (Option C, OWN_TEXT; Toby: "classification ... viewing the source_text, not the evidence_text").
++# WHY: Call 2 judges each unit on its whole text, but the rules below re-label it from the quote (one or two
++# sentences) alone, so a deciding sentence outside the quote was ignored. Two-call records only: a rule may
++# soften the model's label only when the unit's OWN text agrees. "Own text" = the unit's source_text when it
++# is that unit's own (not the clause passage shared by every sub-clause, not "(from main clause)") and on its
++# subject (clause map subject words); otherwise the quote alone is read, as before.
++_OWN_RX: dict = {}
++# PATCH 13-Oct-2026 (P2): units where a favourable finding + "hence not applicable" is Favourable (LABEL VS. SUBSTANCE)
++_P2_FAV_UNITS = {"ix_a", "ix_b", "ix_c", "ix_d", "xi_a", "xi_b", "xi_c", "xiv_a", "xv"}
++# PATCH 13-Oct-2026 (P11, two-call records only): wordings the NA table missed.
++#   Universal Contractors 2021-22/22-23/24-25 (i)(a)(B) "The company has not any intangible assets" (CA NA);
++#   Sunstar 2021-22/2024-25 (iv) "not given any loans to directors or any other person in whom the director is
++#   interested" (CA NA, I19).
++_P11_NA = {
++    "i_a_b": re.compile(r"(?:has|have)\s+not\s+(?:got\s+)?any\s+intangible|does\s+not\s+possess\s+any\s+intangible", re.I),
++    "iv": re.compile(r"not\s+(?:given|granted|made|provided|advanced)\s+any\s+loans?[^.]{0,80}director[^.]{0,80}"
++                     r"(?:is\s+)?interested", re.I),
++}
++
++
++def _p2_finding(rec: dict, uid: str, order_year, q: str) -> bool:
++    """P2: the unit's own text - or, for a statement covering the whole clause ("no fraud ... Hence reporting under
++    3(xi)(a) to (c) is not applicable"), its sentences on the clause's subject - states a favourable finding and
++    nothing says the point does not arise."""
++    own = own_clean_text(rec, None, uid, order_year)
++    if not own:
++        nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++        st = strip_labels(real_text(nf.get("source_text")))
++        mrx = (_OWN_RX.get(2020) or {}).get(uid.lower(), ("", "", [], ""))[3]
++        if st and mrx and not st.lower().startswith("(from main clause)"):
++            own = " ".join(s for s in _sentences(st) if re.search(mrx, s, re.I)
++                           and not re.search(r"\bwhether\b|\?", s, re.I))
++    return bool(own) and bool(_FAVOURABLE_FINDING.search(own)) and not _NOT_ARISING_WORDS.search(own + " " + q)
++
++
++def _p10_carve_out(uid: str, q: str, pat) -> bool:
++    """PATCH 13-Oct-2026 (P10). The sentence that matched the NA phrase carries a carve-out ("except for the details
++    given below" - Starlite 2024-25 (iii)(c)), starts with ANOTHER sub-clause's marker, or is about another
++    sub-clause's subject ("repayable on demand" is (iii)(f) - Apollo 2021-22 (iii)(b)-(d))."""
++    for sent in re.split(r"(?<=[.;])\s+|\n+", q or ""):
++        if not pat.search(sent):
++            continue
++        if _NA_CARVE.search(sent) and re.search(r"\bbelow\b|\bfollowing\b|\bas\s+under\b|\bdetails\b", sent, re.I):
++            return True
++        mk = re.match(r"^\W*\(?\s*([a-h])\s*\)", sent)
++        own_letter = (uid.split("_") + [""])[1][:1].lower()
++        if mk and own_letter and mk.group(1).lower() != own_letter:
++            return True
++        if uid.lower() in ("iii_b", "iii_c", "iii_d", "iii_e") and re.search(r"repayable\s+on\s+demand|without\s+specifying", sent, re.I):
++            return True
++    return False
++
++
++def own_clean_text(rec: dict, main_rec: Optional[dict], uid: str, order_year) -> str:
++    if not (rec.get("_staged") and _patch_on("OWN_TEXT")):
++        return ""
++    nf = rec.get("normalized_fields") if isinstance(rec.get("normalized_fields"), dict) else {}
++    st = real_text(nf.get("source_text"))
++    if not st or st.lower().startswith("(from main clause)"):
++        return ""
++    if main_rec is not None and main_rec is not rec:
++        mnf = main_rec.get("normalized_fields") if isinstance(main_rec.get("normalized_fields"), dict) else {}
++        if _norm(real_text(mnf.get("source_text"))) == _norm(st):
++            return ""
++    try:
++        key = 2016 if _edition(order_year) == 2016 else 2020
++        if key not in _OWN_RX:
++            from .staged_llm import catalogue_units
++            cat = catalogue_units(order_year)
++            mains = {u["unit"]: u.get("subject_rx") or "" for u in cat if u["unit"] == u["main"]}
++            _OWN_RX[key] = {u["unit"].lower(): (u.get("subject_rx") or "", u.get("not_rx") or "",
++                                                [v.get("subject_rx") or "" for v in cat
++                                                 if v["main"] == u["main"] and v["unit"] not in (u["unit"], u["main"])],
++                                                mains.get(u["main"], ""))
++                            for u in cat}
++        rx, nrx, sib, mrx = _OWN_RX[key].get(uid.lower(), ("", "", [], ""))
++        if not rx:
++            return ""
++        # only the sentences on this unit's own subject - not on a sibling's (Starlite 2022-23 (iii)(a)(B) held the
++        # subsidiaries' table) nor another clause's (Jaywant Sugars 2021-22 (x)(a) held the (ix)(c) term-loan sentence)
++        def _sib_words(s: str) -> bool:      # a sibling's own words (not words every unit of the clause uses)
++            return any(not (mrx and re.search(mrx, m.group(0), re.I)) and not re.search(rx, m.group(0), re.I)
++                       for x in sib if x for m in re.finditer(x, s, re.I))
++        keep = [s for s in _sentences(strip_labels(st)) if re.search(rx, s, re.I)
++                and not re.search(r"\bwhether\b|\bif\s+not\b|\bif\s+so\b|\?", s, re.I)    # a printed CARO question
++                and not (nrx and re.search(nrx, s, re.I)) and not _sib_words(s)]
++    except Exception:                                        # noqa: BLE001
++        return ""
++    return " ".join(keep)
++
++
+ def apply_na_clean_table(records: Iterable[dict], order_year) -> list:
+     """Item 6: normalise clean <-> not_applicable by the decision table above.
+     Returns [(unit_id, from, to)]."""
+@@ -1306,8 +1420,23 @@
+             uid = _unit_id(rec, level, main_id)
+             key = next((k for k in na_re if k.lower() == uid.lower()), None)
+             new = None
+-            if cls == "clean" and key and na_re[key].search(q):
+-                if uid.lower() in _P2_UNITS and _activity_happened(q):
++            own = own_clean_text(rec, r, uid, order_year)
++            staged_p = bool(rec.get("_staged"))
++            pat_u = na_re[key] if key else None
++            p11 = _P11_NA.get(uid.lower()) if (staged_p and _patch_on("P11")) else None
++            if cls == "clean" and p11 is not None and p11.search(q) and not (pat_u and pat_u.search(q)):
++                key, pat_u = key or uid, p11              # PATCH 13-Oct-2026 (P11): a wording the table missed
++            if cls == "clean" and pat_u is not None and pat_u.search(q) and staged_p and _patch_on("P10") \
++                    and _p10_carve_out(uid, q, pat_u):
++                rec["own_text_kept"] = {"rule": "na_clean_table", "label": cls, "why": "P10 carve-out / other sub-clause"}
++            elif cls == "clean" and pat_u is not None and pat_u.search(q) and staged_p and _patch_on("P2") and own \
++                    and uid.lower() in _P2_FAV_UNITS and _FAVOURABLE_FINDING.search(own) \
++                    and not _NOT_ARISING_WORDS.search(own):
++                rec["own_text_kept"] = {"rule": "na_clean_table", "label": cls, "why": "P2 favourable finding"}
++            elif cls == "clean" and pat_u is not None and pat_u.search(q):
++                if own and (_activity_happened(own) or _event_stated(uid, own, ed)):
++                    rec["own_text_kept"] = {"rule": "na_clean_table", "label": cls}   # whole text: it happened
++                elif uid.lower() in _P2_UNITS and _activity_happened(q):
+                     pass                                    # V1 (P2): activity stated -> stays Favourable
+                 elif _event_stated(uid, q, ed):
+                     pass                                    # PATCH 7-Oct (D07): event stated -> stays Favourable
+@@ -1315,11 +1444,21 @@
+                     pass                                    # V1: CARO 2016 (ix) needs both halves absent
+                 else:
+                     new = "not_applicable"
+-            elif cls == "not_applicable" and uid.lower() in {u.lower() for u in arises} \
+-                    and not _NOT_ARISING_WORDS.search(q) \
+-                    and (not _NA_WORD.search(q) or _FAVOURABLE_FINDING.search(q)
+-                         or (ed == 2020 and not uid.lower().startswith("x_") and _answer_parts(q))):
+-                new = "clean"                               # V1 (P3): a part of the quote answers the question
++            elif cls == "not_applicable" and ((uid.lower() in {u.lower() for u in arises}
++                                                and not _NOT_ARISING_WORDS.search(q)
++                                                and (not _NA_WORD.search(q) or _FAVOURABLE_FINDING.search(q)
++                                                     or (ed == 2020 and not uid.lower().startswith("x_")
++                                                         and _answer_parts(q))))
++                                               # PATCH 13-Oct-2026 (P2, two-call): the unit's own text states the
++                                               # finding although the quote is only "Hence ... not applicable"
++                                               # (WickedRide 2023-24 (xi)(b)/(c))
++                                               or (staged_p and _patch_on("P2") and ed == 2020
++                                                   and uid.lower() in _P2_FAV_UNITS
++                                                   and _p2_finding(rec, uid, order_year, q))):
++                if own and _NOT_ARISING_WORDS.search(own) and not _FAVOURABLE_FINDING.search(own):
++                    rec["own_text_kept"] = {"rule": "na_clean_table", "label": cls}   # whole text: does not arise
++                else:
++                    new = "clean"                           # V1 (P3): a part of the quote answers the question
+             if new:
+                 rec["na_clean_normalised"] = {"from": cls, "to": new}
+                 rec["llm_classification"] = rec.get("llm_classification", cls)
+@@ -1388,6 +1527,12 @@
+             q_exc = _VI_DISCLAIMER.sub(" ", q) if (key == "vi" and rec.get("_staged") and _patch_on("F13")) else q
+             if not q or _EXCEPTION_RE.search(q_exc) or not _OVERGRADE_FAVOURABLE[key].search(q):
+                 continue
++            own = own_clean_text(rec, r if rec is not r else None, uid, order_year)
++            own_exc = _VI_DISCLAIMER.sub(" ", own) if (key == "vi" and _patch_on("F13")) else own
++            if own and _EXCEPTION_RE.search(own_exc):
++                rec["own_text_kept"] = {"rule": "overgrade_guard", "label": "qualified",
++                                        "words": _EXCEPTION_RE.search(own_exc).group(0)[:80]}
++                continue                            # an exception elsewhere in the unit's own text
+             rec["overgrade_corrected"] = {"from": "qualified", "to": "clean", "rule": key}
+             rec["llm_classification"] = rec.get("llm_classification", "qualified")
+             rec["classification"] = "clean"
+--- a/caro/pipeline.py
++++ b/caro/pipeline.py
+@@ -1863,7 +1863,8 @@
+                 # 2026-09-29 (item 9): CARO 2016 / hybrid layout assessed under CARO
+                 # 2020 -- remove verdicts whose quote is plainly about another clause.
+                 subj_actions = (apply_subject_guard(extracted, caro_text, order_year)
+-                                if _xwalk and _env_flag("CARO_SUBJECT_GUARD", True) else [])
++                                if _xwalk and not ictx.get("crosswalk_off")      # PATCH 13-Oct-2026 (XWALK_LAYOUT)
++                                and _env_flag("CARO_SUBJECT_GUARD", True) else [])
+                 if box_actions or subj_actions:
+                     logger.info("[post_rules] box guard: %s | subject guard: %s", box_actions, subj_actions)
+                 # CHANGE 9 (C11+P6): auditor scope limitations -> qualified,
+--- a/caro/audit.py
++++ b/caro/audit.py
+@@ -64,7 +64,9 @@
+               "explanation_by_code", "blanket_na_rule",
+               "explanation_total_corrected_more",
+               # PATCH 09-Oct-2026 (Phase 2, Option A): two-call trace (mapping check, text moved)
+-              "staged_trace")
++              "staged_trace",
++              # PATCH 13-Oct-2026 (Option C): a code rule did not soften the model's label (unit's own text disagreed)
++              "own_text_kept")
+ 
+ _LOCK = threading.Lock()
+ 
+--- a/tests/run_phase2_cases.py
++++ b/tests/run_phase2_cases.py
+@@ -751,8 +751,10 @@
+     res, notes, recs, ct = run_filing(name, cl, "staged")
+     staged[name] = (res, notes, recs, ct, cl)
+     single = run_filing(name, llm.MockClient(), "single")[0]
+-    check(f"G1 {name}: two model calls (+ at most one re-read), no fallback",
+-          cl.calls[:2] == ["C1", "C2"] and len(cl.calls) <= 3 and not notes.get("stage_fallback"),
++    _p13 = bool(notes.get("staged", {}).get("call1", {}).get("p13_long_field_reask"))   # 13-Oct P13: one long-field re-ask
++    _calls = [c for i, c in enumerate(cl.calls) if not (_p13 and c == "C1" and i == 1)]
++    check(f"G1 {name}: two model calls (+ at most one re-read; + one Call-1 re-ask for a field over the P13 limit), "
++          "no fallback", _calls[:2] == ["C1", "C2"] and len(_calls) <= 3 and not notes.get("stage_fallback"),
+           (cl.calls, notes.get("stage_fallback")))
+     kp_s, kp_1 = key_paths(res), key_paths(single)
+     check(f"G2 {name}: final JSON has exactly the same keys and structure as the single flow",
+@@ -2192,6 +2194,290 @@
+       all(u["explanation_text"].startswith(("Not reported by the auditor:", "Not available in the source:")) for u in _silent),
+       [u["explanation_text"][:60] for u in _silent][:3])
+ 
++# --- PATCH 13-Oct-2026 (amounts): tests named after the filings that showed each problem ---------------
++from caro import amounts as _AM, staged_llm as _SA
++_AC = _AM                     # the amount checks live in caro/amounts.py
++
++
++def _amt(uid, cls, items, text, fy_year):
++    r = {"classification": cls, "evidence_text": text.split("\n")[0], "staged_trace": {}, "sub_clause_id": uid,
++         "normalized_fields": {"source_text": text,
++                               "amount_items": [{"as_printed": a, "counts_toward_total": True} for a in items]}}
++    return _AM.compute(r, uid, text, text, fy_year)
++
++
++_t_iii = ("(iii) (a) The Company has granted loans to the following parties during the year:\nParticulars\nGuarantees\n"
++          "Loans\nAdvances\nAggregate amount granted during the year\nSubsidiaries\n-\n1,250.00\n-\nOthers\n-\n310.00\n-\n"
++          "Balance outstanding as at balance sheet date\nSubsidiaries\n500.00\n2,358.39\n-\nOthers\n-\n1,798.32\n-\n"
++          "(b) The terms are not prejudicial.\n")
++check("AM1 (WickedRide / Shri Dutt (iii)(a)) the (iii)(a) table is read by row label: (A) = subsidiaries' balance "
++      "loan 2,358.39 (guarantee 500 not added), (B) = others' balance 1,798.32; flow rows never used",
++      _AC.iii_a_slot_figures(_t_iii, "A")[0] == ["2,358.39"] and _AC.iii_a_slot_figures(_t_iii, "B")[0] == ["1,798.32"])
++_t_iib = ("(ii)(b) The quarterly statements filed with banks differ from the books as under:\nQuarter\nAmount as per books\n"
++          "Amount as per statement\nDifference\nJun-23\n10,000.00\n9,000.00\n1,000.00\nMar-24\n12,500.00\n10,202.00\n2,298.00\n"
++          "(iii) The Company has not granted loans.\n")
++check("AM2 (Shri Dutt (ii)(b)) the difference column of the year-end quarter is the amount (not the sum of books, "
++      "statement and all quarters)", (_AC.ii_b_difference(_t_iib, [_t_iib.find("2,298.00")]) or [None])[0] == "2,298.00")
++_t_vii = ("(vii)(b) Details of dues not deposited on account of dispute:\nName of statute\nNature\nAmount (Rs.)\n"
++          "Amount paid under protest (Rs.)\nForum\nIncome Tax Act\nIncome tax\n2,068,873\n219,713\nCIT(A)\n")
++_r = _amt("vii_b", "adverse", ["2,068,873", "219,713"], _t_vii, 2021)
++check("AM3 (Aditya 2020-21 (vii)(b)) the 'paid under protest' column is never added to the disputed amount; an "
++      "'Amount (Rs.)' header line is a column, not a unit note", _r["amount_total"] == 2068873.0, _r)
++_t_ix = ("(ix)(a) The Company has defaulted in repayment of loans as under (Rs. in lakh):\nNature\nName of lender\n"
++         "Amount not paid on due date\nWhether principal or interest\nNo. of days delay\nTerm loan\nBank A\n120.50\n"
++         "Principal\n30\nTerm loan\nBank A\n14.20\nInterest\n30\nThe balance of the term loan outstanding is Rs. 9,500.00 lakh.\n")
++_r = _amt("ix_a", "adverse", ["120.50", "14.20", "Rs. 9,500.00 lakh"], _t_ix, 2023)
++check("AM4 (Viraj Canes / Viraj Alchohol (ix)(a)) principal AND interest instalments not paid are added; the loan's "
++      "outstanding balance is not a default amount", _r["amount_total"] == 13470000.0, _r)
++_r = _amt("i_c", "qualified", ["110"], "(i)(c) The title deeds of 110 acre of land are not held in the name of the Company.\n", 2023)
++check("AM5 (Shri Dutt (i)(c)) an area ('110 acre') is never an amount", _r["amount_total"] is None, _r)
++_SA.PATCH_SWITCHES["AMT_PROMPT"] = False
++_off_amt = "AMOUNT ITEMS" in _SA.build_call1_system(2020)
++_SA.PATCH_SWITCHES["AMT_PROMPT"] = True
++check("AM6 Call 1 carries the AMOUNT ITEMS rules (two-call only, switch AMT_PROMPT); the single prompt is untouched; "
++      "every amount fix has a switch",
++      "AMOUNT ITEMS" in _SA.build_call1_system(2020) and not _off_amt
++      and "AMOUNT ITEMS" not in __import__("caro.prompts", fromlist=["x"]).__dict__.get("SYSTEM_PROMPT", "")
++      and all(_AM.amt_switch_on(k) for k in ("TABLE_COLUMNS", "III_A_TABLE", "II_B_DIFF", "NOT_MONEY", "BALANCE_NOT_DEFAULT")))
++_single = {"classification": "adverse", "evidence_text": "x", "sub_clause_id": "vii_b",
++           "normalized_fields": {"source_text": _t_vii, "amount_items": [{"as_printed": "2,068,873", "counts_toward_total": True},
++                                                                       {"as_printed": "219,713", "counts_toward_total": True}]}}
++check("AM7 the new amount checks run only on two-call records (no staged_trace -> single flow unchanged)",
++      not _AC.is_staged(_single) and _AM.compute(_single, "vii_b", _t_vii, _t_vii, 2021)["amount_total"] != 2068873.0)
++
++# --- PATCH 13-Oct-2026 (mapping / crosswalk / Option C): tests named after the filings ---------------
++from caro import post_rules as _PRm, prompts as _PPm
++_sas = ("1. Property, Plant and Equipments (Fixed Asset):\n(a) records maintained.\n9. Default in repayment of borrowings:\n"
++        "(a) The company has not defaulted. (b) not a wilful defaulter. (d) funds raised on short term basis have not been "
++        "used for long-term purposes.\nthe company has not raised moneys by way of initial public offer or further public offer "
++        "including debt instruments and term loans.\n11. Fraud and whistle-blower complaints. No report under section "
++        "143(12) in Form ADT-4. 14. Internal Audit: internal audit system commensurate. 17. Cash Losses: no cash losses. "
++        "18. Resignation of Statutory Auditors: there has been no resignation of the statutory auditors. 19. capable of "
++        "meeting its liabilities. 20. no unspent amount. benami property: none.")
++_hyb = ("(viii) The company has not defaulted in repayment of dues to banks.\n(x) No fraud on or by the company has been "
++        "noticed.\n(xi) Managerial remuneration has been paid in accordance with section 197.\n(xiv) The company has not "
++        "made any preferential allotment or private placement.\n(xvii) The company has not incurred cash losses.\n(xx) no "
++        "unspent amount under section 135(5).")
++_cit = _sas + " Accordingly clause 3(x)(a) is not applicable; clause 3(xvi)(d) is not applicable."
++_mix = ("viii) the company has not defaulted the repayment of dues to banks.\nx) the company has not raised money by way of "
++        "initial public offer or further public offer.\nxi) no fraud on or by the Company has been noticed.\n")
++check("MAP1 (Saspack / U72900DL2007PTC162708 / Garden Court 2024-25) a CARO 2020-layout report is never given the CARO "
++      "2016 crosswalk; real hybrids (Western / Jsons / Atharv) keep it; mixed numbering (Prasad 2022-23) gets the "
++      "subject-only note; CARO 2016 years untouched",
++      st.layout_recheck(_sas, "hybrid", 2023)[0] is None and st.layout_recheck(_cit, "hybrid", 2023)[0] is None
++      and st.layout_recheck(_hyb, "hybrid", 2022)[0] == "hybrid" and st.layout_recheck(_mix, None, 2023)[0] == "mixed"
++      and st.layout_recheck(_sas, "2016", 2019)[0] == "2016"
++      and "NUMBERING NOTE" in st.build_call1_system(2023, crosswalk_layout="mixed")
++      and "NUMBERING NOTE" not in st.build_call1_system(2023))
++_c16 = {u["unit"]: u for u in st.catalogue_units(2016)}
++check("MAP2 (clause map) every CARO 2016 unit carries the subject words of its CARO 2020 successor; (xi) managerial "
++      "remuneration uses the M9 words; (ix) covers public offer AND term loans",
++      all(u["subject_rx"] for u in _c16.values()) and "section 197" in _c16["xi"]["subject_rx"]
++      and "term loan" in _c16["ix"]["subject_rx"] and "public offer" in _c16["ix"]["subject_rx"])
++_c20 = {u["unit"]: u for u in st.catalogue_units(2020)}
++_j17 = st.own_subject_check("xvii", _c20["xvii"], "The company is capable of meeting its liabilities existing at the date "
++                            "of Balance Sheet as and when they fall due within a period of one year.", "", _c20)
++_kr = st.own_subject_check("iii_f", _c20["iii_f"], "(f) The company has granted loans or advances in the nature of loans "
++                           "either repayable on demand or without specifying any terms or period of repayment, if so, "
++                           "specify the aggregate amount", "(iii) the passage", _c20)
++check("MAP3 (F35, Jsons 2021-22 (xvii) / U51909 (iv)) own text on another unit's subject -> one recheck note naming it; "
++      "a bare 'Not applicable', a blanket 'has not granted any loans' and an on-subject answer -> no note",
++      _j17 and "xix" in _j17[1]
++      and st.own_subject_check("iv", _c20["iv"], "The company has not granted any loans, secured or unsecured, to "
++                               "companies covered in the register maintained under Section 189. Therefore clause (iii)(a) "
++                               "to (f) are not applicable.", "", _c20) is not None
++      and st.own_subject_check("v", _c20["v"], "Not applicable", "", _c20) is None
++      and st.own_subject_check("iii_b", _c20["iii_b"], "During the year the company has not made any investment in, "
++                               "provided any guarantee or granted any loan or advance in the nature of loans.", "x", _c20) is None
++      and st.own_subject_check("xvii", _c20["xvii"], "The company has not incurred cash losses.", "", _c20) is None)
++_u = {"iii": dict(st._empty_unit(), source="Except for business purpose.\nThe company has granted loans to employees."),
++      "iii_a_A": dict(st._empty_unit(), source="Except for business purpose."), "iii_a_B": st._empty_unit()}
++_nn = {}
++st.apply_moves(_u, {"iii_a_A": {"moves": [{"to": "iii_a_B", "text": "The company has granted loans to employees."}]}},
++               [], [], "x", st.catalogue_units(2023), _nn)
++check("MAP4 (Prasad 2023-24 (iii)(a)) a Call 2 move of words that are in the clause passage (shown as 'same as passage') "
++      "is applied to the unit they answer; nothing is removed from the passage",
++      "employees" in _u["iii_a_B"]["source"] and "employees" in _u["iii"]["source"]
++      and _nn["moves"][0]["result"] == "placed from the clause passage", _nn.get("moves"))
++_sys1, _sys2 = st.build_call1_system(2023), st.build_call2_system(2016)
++st.PATCH_SWITCHES["ONE_UNIT"] = False
++_off1 = "ONE UNIT, ONE ANSWER" in st.build_call1_system(2023)
++st.PATCH_SWITCHES["ONE_UNIT"] = True
++check("MAP5 Call 1 'ONE UNIT, ONE ANSWER' and Call 2 'WHOLE TEXT, OWN QUESTION' (both Orders); switch ONE_UNIT; the single "
++      "prompt has neither", "ONE UNIT, ONE ANSWER" in _sys1 and "WHOLE TEXT, OWN QUESTION" in _sys2 and not _off1
++      and "ONE UNIT" not in _PPm.build_system_prompt(2023) and "WHOLE TEXT" not in _PPm.build_system_prompt(2016))
++
++
++def _og(staged):
++    sub = {"sub_clause_id": "i_b", "classification": "qualified",
++           "evidence_text": "physical verification was carried out and no material discrepancies were noticed.",
++           "normalized_fields": {"source_text": "The fixed assets were physically verified and no material discrepancies were "
++                                 "noticed, except that assets at the Pune plant could not be verified."}}
++    if staged:
++        sub["_staged"] = True
++    rec = {"main_clause_id": "i", "classification": "qualified", "evidence_text": "-", "sub_clauses": [sub],
++           "normalized_fields": {"source_text": "(i) the clause passage"}}
++    _PRm.apply_overgrade_guard([rec], 2023)
++    return sub["classification"]
++
++
++check("MAP6 (Option C) a two-call Qualified is not softened from its quote when the unit's own text states the exception "
++      "elsewhere; the single flow behaves as before", _og(True) == "qualified" and _og(False) == "clean")
++_own = ("Details of loans given:\nParticulars\nGuarantees\nLoans\nAggregate amount during the year\nSubsidiaries\n500.00\n"
++        "1,250.00\nBalance outstanding\nSubsidiaries\n-\n2,358.39\n")
++check("MAP7 (WickedRide 2022-23 (iii)(a)(A)) a table quote the model re-wrote ('(Loans) 2,358.39') becomes the auditor's own "
++      "lines holding the same figures", (st._table_block(_own, "Subsidiaries (Guarantees) 500.00 (Loans) 1,250.00 ... 2,358.39")
++                                          or "").endswith("2,358.39") and st._table_block(_own, "(Loans) 9,999.00 2,358.39") is None)
++
++# --- PATCH 13-Oct-2026 evening batch (P1 P2 P4 P5 P6 P7A-E P8 P10 P11 P13 P15 P16 P18): tests named after filings ---
++_by20, _by16 = {u["unit"]: u for u in st.catalogue_units(2023)}, {u["unit"]: u for u in st.catalogue_units(2019)}
++
++
++def _bn(by, units, ans, oy=2023):
++    rc, tags, _m, _s = st.batch_notices(ans, {k: dict(st._empty_unit(), source=v) for k, v in units.items()}, by, oy,
++                                       final=False, notes={})
++    return rc, tags
++
++
++_star_vii = ("(vii) (a) Undisputed statutory dues have generally been regularly deposited.\n(b) According to the information "
++             "and explanations given to us, no undisputed amounts payable were in arrears for more than six months.\n(c) "
++             "According to the records of the Company, the dues outstanding in respect of sales tax on account of any "
++             "dispute are as follows:\nName of Statute\nAmount\nThe Andhra Pradesh General Sales Tax\n24.27\n1996-97\n"
++             "Honble High Court of Telangana")
++_rc, _tg = _bn(_by16, {"vii": _star_vii, "vii_b": "(b) According to the information and explanations given to us, no "
++                       "undisputed amounts payable were in arrears for more than six months."},
++               {"vii_b": {"classification": "clean", "evidence": "x", "explanation": "x"}}, 2019)
++_rc2, _ = _bn(_by16, {"vii": "(vii) (a) regular.\n(b) There are no dues of income tax which have not been deposited on "
++                      "account of any dispute.", "vii_b": "(a) regular."},
++              {"vii_b": {"classification": "clean", "evidence": "x", "explanation": "x"}}, 2019)
++check("P1 (TRIAL, Starlite 2020-21 CARO 2016) (vii)(b) with no dispute text gets a note quoting the dispute sentence and "
++      "table of the (vii) paragraph; a denial of disputed dues never triggers it",
++      "P1" in _tg.get("vii_b", set()) and "24.27" in _rc.get("vii_b", "") and "P1" not in str(_rc2), (_rc, _rc2))
++_sd = ("(vii) (a) undisputed statutory dues have been regularly deposited, except as given in Para(b) below.\n(b)\n"
++       "undisputed amounts payable in respect of provident fund were outstanding as at March 31, 2024 for a period of more "
++       "than six months from the date they became payable:\nProvident Fund\n4.14\n(c) no disputed dues.")
++_rc, _tg = _bn(_by20, {"vii": _sd, "vii_a": "undisputed statutory dues have been regularly deposited, except as given in "
++                       "Para(b) below."}, {"vii_a": {"classification": "qualified", "evidence": "x", "explanation": "x"}})
++check("P16 (TRIAL, Shri Dutt 2023-24 (vii)(a)) 'except as given in Para(b) below' -> the note quotes Para (b) of the same "
++      "clause; the label is the model's", "P16" in _tg.get("vii_a", set()) and "Provident Fund" in _rc.get("vii_a", ""), _rc)
++def _na_unit(uid, txt, staged=True):
++    sub = {"sub_clause_id": uid, "classification": "not_applicable", "evidence_text": "Hence reporting under clause "
++           "3(xi)(a) to (c) is not applicable.", "normalized_fields": {"source_text": txt}}
++    if staged:
++        sub["_staged"] = True
++    _PRm.apply_na_clean_table([{"main_clause_id": uid.split("_")[0], "classification": "not_applicable",
++                                "evidence_text": "-", "sub_clauses": [sub], "normalized_fields": {"source_text": "x"}}], 2023)
++    return sub["classification"]
++
++
++_wr = "No fraud by the company or on the company has been noticed or reported during the year. Hence reporting under clause 3(xi)(a) to (c) is not applicable."
++_rc, _tg = _bn(_by20, {"ix": "x", "ix_c": "The term loans were applied for the purpose for which they were obtained. Hence "
++                       "clause 3(ix)(c) is not applicable."},
++               {"ix_c": {"classification": "not_applicable", "evidence": "x", "explanation": "x"}})
++_rc2, _tg2 = _bn(_by20, {"ix": "x", "ix_c": "The company does not have any term loans. Hence clause 3(ix)(c) is not "
++                         "applicable; applied for the purpose."}, {"ix_c": {"classification": "not_applicable",
++                                                                            "evidence": "x", "explanation": "x"}})
++check("P2 (WickedRide 2023-24 (xi)(b)) a favourable finding in the unit's own text + 'hence not applicable' in the quote -> "
++      "Favourable by the NA/clean table (two-call only); (ix)(c) gets one re-read; a real not-arising answer does not; "
++      "the prompt line is CARO 2020 only",
++      _na_unit("xi_b", _wr) == "clean" and _na_unit("xi_b", _wr, staged=False) == "not_applicable"
++      and "P2" in _tg.get("ix_c", set()) and "P2" not in _tg2.get("ix_c", set())
++      and "ONLY for (ix)(e) and (ix)(f)" in st.build_call2_system(2023)
++      and "ONLY for (ix)(e) and (ix)(f)" not in st.build_call2_system(2019))
++check("P4 / P15 / P18 prompt lines: (iii)(a) judged on the amounts only (missing amounts = incomplete); (viii) convention; "
++      "rights issue / allotment without compliance statement; none in the single prompt",
++      all(x in st.build_call2_system(2023) for x in ("ask ONLY the aggregate amount", "(viii): 'there are no transactions",
++                                                     "a rights issue alone"))
++      and "CARO 2016 (xiv): a rights issue" in st.build_call2_system(2019)
++      and "a rights issue alone" not in _PPm.build_system_prompt(2023))
++_rc, _tg = _bn(_by20, {"iii": "x", "iii_a_B": "The Company has granted loans to its subsidiaries amounting to Rs. 5 lakh."},
++               {"iii_a_B": {"classification": "clean", "evidence": "The Company has granted loans to its subsidiaries "
++                            "amounting to Rs. 5 lakh.", "explanation": "x"}})
++check("P6 (Shri Dutt 2024-25 (iii)(a)(B)) the F16 note asks to move ONLY the words that name subsidiaries and keep (B)'s "
++      "own denial; the 90-character look-back is unchanged (replay: a wider one removed a correct note)",
++      "Move ONLY the words" in _rc.get("iii_a_B", ""), _rc)
++_uc = ("Based on our examination, the provision of section 135 are applicable on the company but has not been complied "
++       "with also proper information has not been provided to report the required transactions/figures .")
++
++
++def _csr(staged):
++    sub = {"sub_clause_id": "xx_a", "classification": "qualified", "evidence_text": _uc,
++           "normalized_fields": {"source_text": _uc}}
++    if staged:
++        sub["_staged"] = True
++    _PRm.apply_adverse_triggers([{"main_clause_id": "xx", "classification": "qualified", "evidence_text": "-",
++                                  "sub_clauses": [sub], "normalized_fields": {}}], 2023, set(), None)
++    return sub["classification"], sub.get("review_reasons") or []
++
++
++_a, _b = _csr(True), _csr(False)
++check("P7A (TRIAL, Universal Contractors 2021-22 (xx)) 's.135 applicable but has not been complied with' -> adverse with "
++      "the review reason trial:P7A, two-call records only (single flow unchanged)",
++      _a[0] == "adverse" and "trial:P7A" in _a[1] and _b[0] == "qualified", (_a, _b))
++_rc, _tg = _bn(_by20, {"xvi": "x", "xvi_a": "The particulars of registration are as under:"},
++               {"xvi_a": {"classification": "clean", "evidence": "x", "explanation": "x"}})
++_rc3, _tg3 = _bn(_by20, {"vii": "x", "vii_a": "Undisputed dues are regular. Dues payable for more than six months: "
++                         "Provident Fund 4,14,000 for 2023-24."},
++                 {"vii_a": {"classification": "qualified", "evidence": "x", "explanation": "x"}})
++_rc4, _tg4 = _bn(_by20, {"xiv": "x", "xiv_a": "The company is required to have an internal audit system but internal audit "
++                         "has not been carried out during the year."},
++                 {"xiv_a": {"classification": "clean", "evidence": "x", "explanation": "x"}})
++_rc5, _tg5 = _bn(_by20, {"vi": "The company maintains cost records but the details of the cost audit are not stated."},
++                 {"vi": {"classification": "insufficient_evidence", "evidence": "", "explanation": "The answer is "
++                         "incomplete: the outcome is not stated."}})
++_rc6, _tg6 = _bn(_by20, {"xiii": "All transactions with related parties are in compliance with sections 177 and 188."},
++                 {"xiii": {"classification": "clean", "evidence": "x", "explanation": "Compliance is implied by the "
++                           "disclosure."}})
++check("P7B-E (TRIAL) / P8 notes: particulars announced but not given; arrears > 6 months listed under (vii)(a); internal "
++      "audit required but not carried out; 'insufficient' with an 'incomplete' explanation; a guessing explanation - each "
++      "one recheck note, no label set by code",
++      "P7B" in _tg.get("xvi_a", set()) and "P7C" in _tg3.get("vii_a", set()) and "P7D" in _tg4.get("xiv_a", set())
++      and "P7E" in _tg5.get("vi", set()) and "P8" in _tg6.get("xiii", set()))
++
++
++def _nat(uid, q, staged=True):
++    sub = {"sub_clause_id": uid, "classification": "clean", "evidence_text": q, "normalized_fields": {"source_text": q}}
++    if staged:
++        sub["_staged"] = True
++    _PRm.apply_na_clean_table([{"main_clause_id": uid.split("_")[0], "classification": "clean", "evidence_text": "-",
++                                "sub_clauses": [sub], "normalized_fields": {}}], 2023)
++    return sub["classification"]
++
++
++check("P10 (Starlite 2024-25 (iii)(c), Apollo 2021-22 (iii)(b)) no Not Applicable from a sentence with 'except ... below' "
++      "or from the (f) on-demand sentence; P11 (Universal Contractors (i)(a)(B)) 'has not any intangible assets' -> NA "
++      "(two-call only)",
++      _nat("iii_c", "The Company has not granted any loans except for the details given below.") == "clean"
++      and _nat("iii_b", "f) The Company has not granted any loans or advances repayable on demand or without specifying "
++                        "any terms.") == "clean"
++      and _nat("i_a_B", "The company has not any intangible assets.") == "not_applicable"
++      and _nat("i_a_B", "The company has not any intangible assets.", staged=False) == "clean")
++check("P11 (Sahyadri 2024-25 (x)(b)) a box holding only 'As mentioned in the Audit report' points to text not in the input "
++      "(two-call only); P11 (Prasad 2020-21 (ii)) 'not provided by the management ... unable to say' is a scope limitation",
++      _PRm.points_to_attachment({"_staged": True, "evidence_text": "As mentioned in the Audit report",
++                                 "normalized_fields": {}})
++      and not _PRm.points_to_attachment({"evidence_text": "As mentioned in the Audit report", "normalized_fields": {}})
++      and st._SCOPE_MEANING.search("the stock records are not provided by the management, hence we are unable to say"))
++_loop = ("There are no unrecorded transactions. " + "According to the information given to us, the Company has not made "
++         "any default in repayment of loan. Accordingly, the provisions of clause 3(ix) are not applicable. " * 40)
++_cut, _did = st.cut_runaway(_loop, "There are no unrecorded transactions. According to the information given to us, the "
++                            "Company has not made any default in repayment of loan. Accordingly, the provisions of "
++                            "clause 3(ix) are not applicable.")
++_sch = st.call1_schema(st.source_limit("x" * 7826))
++check("P13 (K.R. Foods 2021-22) Call-1 source_text limit = 6,000 characters (Toby 13-Oct; second attempt 7,200); a "
++      "looping field is cut at the first repeated sentence; a field the filing really prints twice is kept",
++      _did and _cut.count("not made any default") == 1 and st.source_limit("x" * 7826) == 6000
++      and st.source_limit("x" * 100) == 6000 and int(st.source_limit("x") * 1.2) == 7200
++      and _sch["properties"]["clauses"]["items"]["properties"]["normalized_fields"]["properties"]["source_text"]["maxLength"] == 6000
++      and not st.cut_runaway("A long sentence that the auditor prints twice on purpose here. A long sentence that the "
++                             "auditor prints twice on purpose here.", "A long sentence that the auditor prints twice on "
++                             "purpose here. A long sentence that the auditor prints twice on purpose here.")[1])
++_rm = {}
++st._batch_marks(_rm, "vii_b", {"patch_units": {"vii_b": ["P1", "F09"]}}, set())
++check("TRIAL flags: a unit touched by a trial fix carries the review reason 'trial:<fix>' (an existing review value, no new "
++      "JSON key); TRIAL_FIXES lists P1, F35 (P3), P16, P7A-P7E",
++      "trial:P1" in (_rm.get("review_reasons") or []) and {"P1", "F35", "P16", "P7A", "P7E"} <= st.TRIAL_FIXES)
++
+ urllib.request.urlopen = _real_urlopen
+ n_ok = sum(ok for _n, ok in RESULTS)
+ print(f"\n{n_ok}/{len(RESULTS)} Phase 2 checks passed")
+--- /dev/null
++++ b/tools/check_vllm_maxlength.py
+@@ -0,0 +1,43 @@
++"""PATCH 13-Oct-2026 (P13) - one-minute check that the vLLM server enforces a text-field length limit
++(JSON schema "maxLength") under guided JSON. Run once before the next two-call run:
++
++    python tools/check_vllm_maxlength.py
++
++It reads the same .env settings as run.py (LLM_BACKEND, LLM_BASE_URL, LLM_MODEL, LLM_GUIDED_JSON) and sends ONE
++small request whose field is limited to 40 characters while the model is asked to write about 400.
++
++  PASS   - the reply field is 40 characters or less: the P13 loop limit works on this server.
++  FAIL   - the field is longer: this server ignores maxLength. P13 then has no effect (nothing breaks); the old
++           cut-off salvage still applies. Tell Claude, so the code-side stop is used instead.
++No client data is sent.
++"""
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++try:
++    from dotenv import load_dotenv          # optional, as in run.py
++    load_dotenv()
++except Exception:                            # noqa: BLE001
++    pass
++from caro.cin_pipeline import default_client_kwargs   # noqa: E402
++from caro.llm import make_client                      # noqa: E402
++
++LIMIT = 40
++schema = {"title": "maxlength_check", "type": "object",
++          "properties": {"text": {"type": "string", "maxLength": LIMIT}}, "required": ["text"]}
++backend, kw = default_client_kwargs()
++kw["max_tokens"] = 400
++client = make_client(backend, **kw)
++raw = client.chat("Return JSON only.", 'Return {"text": "..."} where text is the sentence "The quick brown fox jumps '
++                  'over the lazy dog." written ten times.', schema=schema)
++try:
++    val = json.loads(raw).get("text", "")
++except Exception:                            # noqa: BLE001
++    print("Could not read the reply as JSON - first 300 characters:\n", (raw or "")[:300])
++    sys.exit(2)
++print(f"field length: {len(val)} (limit {LIMIT})")
++print("PASS - maxLength is enforced; P13 is active." if len(val) <= LIMIT
++      else "FAIL - this server ignores maxLength; P13 has no effect here (nothing breaks).")
++sys.exit(0 if len(val) <= LIMIT else 1)
